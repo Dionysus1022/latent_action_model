@@ -1,0 +1,36 @@
+defaults:
+  - task: cube
+  - _self_
+
+data:
+  root: /data/ykz
+
+pipeline:
+  output_root: ${task.data_root}/diffusion_pipeline
+  device: cuda
+  seed: 42
+  use_raw_dataset: true
+  train_ratio: 0.8
+  num_samples: 200000
+  build_batch_size: 128
+  force_split: false
+  force_dataset: false
+  force_anchors: false
+  force_train: false
+  dry_run: false
+
+anchors:
+  num_anchors: 128
+  max_samples: 200000
+  max_iter: 300
+
+train:
+  epochs: 80
+  batch_size: 64
+  val_batch_size: 128
+  num_workers: 4
+  loss_preset: simple_bce
+  lr: 0.001
+  weight_decay: 0.0001
+  val_split: 0.1
+  log_every: 50

@@ -1,0 +1,19 @@
+name: reacher
+eval_config: reacher
+data_root: /data/ykz/reacher
+dataset_name: dmc/reacher_random
+raw_h5: /data/ykz/reacher/reacher.h5
+split_train_root: /data/ykz/reacher/splits/reacher_random_train
+split_val_root: /data/ykz/reacher/splits/reacher_random_val
+split_train_h5: /data/ykz/reacher/splits/reacher_random_train/dmc/reacher_random.h5
+split_val_h5: /data/ykz/reacher/splits/reacher_random_val/dmc/reacher_random.h5
+planner_dataset_path: ${pipeline.output_root}/reacher_planner_dataset.pt
+anchor_bundle_path: ${pipeline.output_root}/reacher_action_anchors_k${anchors.num_anchors}.pt
+train_output_dir: ${pipeline.output_root}/reacher_diffusion_k${anchors.num_anchors}_${pipeline.num_samples}
+wm_policy: /data/ykz/reacher/lewm_epoch_29
+episode_key: auto
+download_if_missing: false
+download:
+  url: https://hf-mirror.com/datasets/quentinll/lewm-reacher/resolve/main/reacher.tar.zst
+  archive_type: tar.zst
+  output: /data/ykz/reacher/reacher.tar.zst

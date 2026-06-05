@@ -1,0 +1,6 @@
+name: cube
+data_root: /data/ykz/cube
+planner_dataset_path: /data/ykz/cube/diffusion_pipeline/cube_planner_dataset.pt
+diffusion_bundle_path: /data/ykz/cube/diffusion_pipeline/cube_diffusion_k128_200000/diffusion_planner_best_bundle.pt
+consistency_output_dir: /data/ykz/cube/diffusion_pipeline/consistency
+wm_policy: /data/ykz/cube/lewm_epoch_27

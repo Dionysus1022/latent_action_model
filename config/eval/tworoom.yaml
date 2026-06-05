@@ -1,0 +1,151 @@
+defaults:
+  - launcher: local
+  - _self_
+
+world:
+  env_name: swm/TwoRoom-v1
+  num_envs: ${eval.num_eval}
+  max_episode_steps: ??? # make sure it's >= eval_budget
+  history_size: 1
+  frame_skip: 1
+
+seed: 42
+task: tworoom
+eval_profile: null
+
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+    - proprio
+
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 5 # frameskip
+
+# evaluation from dataset (replay expert trajectories)
+eval:
+  num_eval: 50
+  goal_offset_steps: 25
+  eval_budget: 50
+  img_size: 224
+  dataset_name: tworoom
+  callables:
+    # -- set state
+    - method: _set_state
+      args:
+        state:
+          value: proprio
+    # -- set goal state
+    - method: _set_goal_state
+      args:
+        goal_state:
+          value: goal_proprio
+
+output:
+  filename: tworoom_results.txt
+
+diffusion_selection_mode: null
+diffusion_num_candidates: null
+diffusion_truncation_steps: null
+diffusion_start_timestep: null
+diffusion_eta: null
+diffusion_noise_scale: null
+diffusion_sampling_temperature: null
+diffusion_runtime_execute_steps: null
+gc_idm_bundle: null
+
+trajectory_quality:
+  enabled: false
+  save_npz: true
+  truncate_after_success: true
+  save_video: true
+
+solver_defaults: &cem_solver
+  _target_: stable_worldmodel.solver.CEMSolver
+  model: ???
+  batch_size: 1
+  num_samples: 300
+  var_scale: 1.0
+  n_steps: 30
+  topk: 30
+  device: cuda
+  seed: ${seed}
+
+diffusion_refinement: &diffusion_refinement_defaults
+  enabled: null
+  steps: null
+  step_size: null
+  topk: null
+  goal_weight: null
+  prior_weight: null
+  smoothness_weight: null
+  grad_clip_norm: null
+
+corrective: &corrective_defaults
+  enabled: null
+  mode: null
+  corrector_path: null
+  correction_interval: null
+  execute_horizon: null
+  error_threshold: null
+  trigger_stat: null
+  trigger_quantile: null
+  trigger_scope: null
+  error_metric: null
+  logging:
+    log_prediction_error: null
+    log_correction_norm: null
+    log_replan_count: null
+
+profiles:
+  mpc:
+    planner_type: mpc
+    policy: /data/ykz/tworoom/lewm_epoch_67
+    solver:
+      <<: *cem_solver
+  gc_idm:
+    planner_type: gc_idm
+    policy: /data/ykz/tworoom/lewm_epoch_67
+    gc_idm_bundle: /data/ykz/tworoom/gc_idm/gc_idm_best_bundle.pt
+  diffusion: &tworoom_diffusion_profile
+    planner_type: diffusion
+    policy: /data/ykz/tworoom/lewm_epoch_67
+    diffusion_bundle: /data/ykz/tworoom/diffusion_pipeline/tworoom_diffusion_k128_200000/diffusion_planner_best_bundle.pt
+    diffusion_selection_mode: wm_only
+    diffusion_num_candidates: 128
+    diffusion_truncation_steps: null
+    diffusion_start_timestep: null
+    diffusion_eta: 0.0
+    diffusion_noise_scale: 1.0
+    diffusion_sampling_temperature: 1.0
+    diffusion_runtime_execute_steps: null
+    diffusion_refinement:
+      <<: *diffusion_refinement_defaults
+      enabled: false
+      steps: 1
+      step_size: 0.03
+      topk: 16
+      goal_weight: 1.0
+      prior_weight: 0.05
+      smoothness_weight: 0.005
+      grad_clip_norm: 1.0
+    corrective:
+      <<: *corrective_defaults
+      enabled: false
+      mode: none
+      correction_interval: 2
+      error_threshold: 0.5
+      trigger_stat: max
+      trigger_quantile: 0.9
+      trigger_scope: per_env
+      error_metric: l2
+      logging:
+        log_prediction_error: false
+        log_correction_norm: true
+        log_replan_count: true
+  consistency:
+    <<: *tworoom_diffusion_profile
+    diffusion_bundle: /data/ykz/tworoom/diffusion_pipeline/consistency/consistency_planner_best_bundle.pt
+    diffusion_truncation_steps: 1

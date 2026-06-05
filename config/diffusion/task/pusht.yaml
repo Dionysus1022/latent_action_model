@@ -1,0 +1,19 @@
+name: pusht
+eval_config: pusht
+data_root: /data/ykz/pusht
+dataset_name: pusht_expert_train
+raw_h5: /data/ykz/pusht/pusht_expert_train.h5
+split_train_root: /data/ykz/pusht/splits/pusht_expert_train_train
+split_val_root: /data/ykz/pusht/splits/pusht_expert_train_val
+split_train_h5: /data/ykz/pusht/splits/pusht_expert_train_train/pusht_expert_train.h5
+split_val_h5: /data/ykz/pusht/splits/pusht_expert_train_val/pusht_expert_train.h5
+planner_dataset_path: ${pipeline.output_root}/pusht_planner_dataset.pt
+anchor_bundle_path: ${pipeline.output_root}/pusht_action_anchors_k${anchors.num_anchors}.pt
+train_output_dir: ${pipeline.output_root}/pusht_diffusion_k${anchors.num_anchors}_${pipeline.num_samples}
+wm_policy: /data/ykz/pusht/lewm_epoch_100
+episode_key: auto
+download_if_missing: false
+download:
+  url: https://hf-mirror.com/datasets/quentinll/lewm-pusht/resolve/main/pusht_expert_train.h5.zst
+  archive_type: h5.zst
+  output: /data/ykz/pusht/pusht_expert_train.h5.zst

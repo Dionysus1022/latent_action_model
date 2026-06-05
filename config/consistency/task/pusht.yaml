@@ -1,0 +1,6 @@
+name: pusht
+data_root: /data/ykz/pusht
+planner_dataset_path: /data/ykz/pusht/diffusion_pipeline/pusht_planner_dataset.pt
+diffusion_bundle_path: /data/ykz/pusht/diffusion_pipeline/pusht_diffusion_k128_200000/diffusion_planner_best_bundle.pt
+consistency_output_dir: /data/ykz/pusht/diffusion_pipeline/consistency
+wm_policy: /data/ykz/pusht/lewm_epoch_100

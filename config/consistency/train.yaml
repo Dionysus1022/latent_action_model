@@ -1,0 +1,41 @@
+defaults:
+  - task: cube
+  - _self_
+
+teacher:
+  bundle_path: ${task.diffusion_bundle_path}
+  student_init_bundle_path: null
+
+output:
+  dir: ${task.consistency_output_dir}
+
+runtime:
+  device: cuda
+  seed: 42
+
+train:
+  epochs: 50
+  batch_size: 128
+  val_batch_size: 256
+  val_split: 0.1
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  log_every: 50
+
+distill:
+  ctm_loss_weight: 1.0
+  action_loss_weight: 1.0
+  goal_loss_weight: 0.0
+  score_loss_weight: 0.0
+  dsm_loss_weight: 0.0
+  teacher_ode_steps: 2
+  huber_delta: 0.0
+  ema_decay: 0.999
+  timestep_sampling: uniform
+
+goal_loss:
+  history_size: 3
+  receding_horizon: null
+  action_block: null

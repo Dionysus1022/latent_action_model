@@ -1,0 +1,6 @@
+# @package _global_
+
+defaults:
+  - /legacy/solver: cem
+
+planner_type: mpc
