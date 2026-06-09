@@ -1,0 +1,10 @@
+dataset:
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  frameskip: 5
+  name: visual-puzzle-3x3-play-v0
+  cache_dir: /data/ykz/puzzle
+  keys_to_load:
+    - pixels
+    - action
+  keys_to_cache:
+    - action

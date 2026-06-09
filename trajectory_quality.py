@@ -255,7 +255,94 @@ def compute_trajectory_quality(
     return summary, per_episode_arrays
 
 
+def compute_latent_monotonicity(
+    *,
+    latents: Any,
+    goal_latents: Any,
+    successes_by_step: Any | None = None,
+    truncate_after_success: bool = True,
+    tolerance: float = 1e-9,
+) -> tuple[dict[str, float], dict[str, np.ndarray]]:
+    """Compute episode-level latent monotonicity toward the goal.
+
+    The LGBS paper reports monotonicity as the fraction of episodes for which
+    ||z_t - z_goal|| decreases at every step. We also return the per-episode
+    step fraction as a diagnostic, but ``latent_monotonicity_mean`` follows the
+    paper's all-steps episode-level definition.
+    """
+    latent_array = _as_float_array(latents, name="latents")
+    goal_array = np.asarray(goal_latents, dtype=np.float64)
+    if goal_array.ndim == 2:
+        goal_array = np.broadcast_to(
+            goal_array[:, None, :],
+            (latent_array.shape[0], latent_array.shape[1], goal_array.shape[-1]),
+        )
+    elif goal_array.ndim < 3:
+        raise ValueError(f"goal_latents must have shape [episodes, dim] or [episodes, steps, dim], got {goal_array.shape}.")
+
+    if latent_array.shape != goal_array.shape:
+        raise ValueError(
+            f"latents and goal_latents must have matching shape after broadcast: "
+            f"{latent_array.shape} != {goal_array.shape}."
+        )
+
+    successes = None
+    if successes_by_step is not None:
+        successes = np.asarray(successes_by_step, dtype=bool)
+        if successes.shape != latent_array.shape[:2]:
+            raise ValueError(
+                f"successes_by_step shape {successes.shape} does not match latents {latent_array.shape[:2]}."
+            )
+
+    monotonicity = []
+    monotonic_step_fraction = []
+    final_latent_goal_distance = []
+    min_latent_goal_distance = []
+    for episode_index in range(latent_array.shape[0]):
+        end_exclusive = latent_array.shape[1]
+        if successes is not None and np.any(successes[episode_index]) and truncate_after_success:
+            end_exclusive = int(np.argmax(successes[episode_index])) + 1
+
+        z_episode = latent_array[episode_index, :end_exclusive]
+        g_episode = goal_array[episode_index, :end_exclusive]
+        valid = np.isfinite(z_episode).all(axis=-1) & np.isfinite(g_episode).all(axis=-1)
+        z_episode = z_episode[valid]
+        g_episode = g_episode[valid]
+        if z_episode.shape[0] == 0:
+            monotonicity.append(float("nan"))
+            final_latent_goal_distance.append(float("nan"))
+            min_latent_goal_distance.append(float("nan"))
+            continue
+
+        distances = _l2(z_episode - g_episode)
+        final_latent_goal_distance.append(float(distances[-1]))
+        min_latent_goal_distance.append(float(np.min(distances)))
+        if distances.shape[0] < 2:
+            monotonicity.append(float("nan"))
+            monotonic_step_fraction.append(float("nan"))
+        else:
+            monotonic_steps = distances[1:] <= distances[:-1] + float(tolerance)
+            monotonicity.append(float(np.all(monotonic_steps)))
+            monotonic_step_fraction.append(float(np.mean(monotonic_steps)))
+
+    per_episode = {
+        "latent_monotonicity": np.asarray(monotonicity, dtype=np.float64),
+        "latent_monotonic_step_fraction": np.asarray(monotonic_step_fraction, dtype=np.float64),
+        "final_latent_goal_distance": np.asarray(final_latent_goal_distance, dtype=np.float64),
+        "min_latent_goal_distance": np.asarray(min_latent_goal_distance, dtype=np.float64),
+    }
+    summary = {
+        "latent_monotonicity_mean": _nanmean(per_episode["latent_monotonicity"]),
+        "latent_monotonicity_std": float(np.nanstd(per_episode["latent_monotonicity"])),
+        "latent_monotonic_step_fraction_mean": _nanmean(per_episode["latent_monotonic_step_fraction"]),
+        "final_latent_goal_distance_mean": _nanmean(per_episode["final_latent_goal_distance"]),
+        "min_latent_goal_distance_mean": _nanmean(per_episode["min_latent_goal_distance"]),
+    }
+    return summary, per_episode
+
+
 __all__ = [
+    "compute_latent_monotonicity",
     "compute_task_goal_distances",
     "compute_trajectory_quality",
 ]

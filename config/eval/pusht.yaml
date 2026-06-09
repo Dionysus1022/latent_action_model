@@ -55,7 +55,6 @@ diffusion_eta: null
 diffusion_noise_scale: null
 diffusion_sampling_temperature: null
 diffusion_runtime_execute_steps: null
-gc_idm_bundle: null
 
 trajectory_quality:
   enabled: false
@@ -106,10 +105,6 @@ profiles:
     policy: /data/ykz/pusht/lewm_epoch_100
     solver:
       <<: *cem_solver
-  gc_idm:
-    planner_type: gc_idm
-    policy: /data/ykz/pusht/lewm_epoch_100
-    gc_idm_bundle: /data/ykz/pusht/gc_idm/gc_idm_best_bundle.pt
   diffusion: &pusht_diffusion_profile
     planner_type: diffusion
     policy: /data/ykz/pusht/lewm_epoch_100

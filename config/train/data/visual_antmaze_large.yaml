@@ -1,0 +1,10 @@
+dataset:
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  frameskip: 5
+  name: visual-antmaze-large-navigate-v0
+  cache_dir: /data/ykz/antmaze
+  keys_to_load:
+    - pixels
+    - action
+  keys_to_cache:
+    - action

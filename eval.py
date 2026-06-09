@@ -19,10 +19,13 @@ from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
 from diffusion.policy import DiffusionPlannerPolicy
-from planners.gc_idm_policy import GCIDMPolicy
 from planners.multi_candidate_policy import MultiCandidatePolicy
 from planners.single_peak_policy import SinglePeakPolicy
-from trajectory_quality import compute_task_goal_distances, compute_trajectory_quality
+from trajectory_quality import (
+    compute_latent_monotonicity,
+    compute_task_goal_distances,
+    compute_trajectory_quality,
+)
 
 
 TASK_ALIASES = {
@@ -80,7 +83,6 @@ PROFILE_SCALAR_DEFAULTS = {
     "diffusion_noise_scale": None,
     "diffusion_sampling_temperature": None,
     "diffusion_runtime_execute_steps": None,
-    "gc_idm_bundle": None,
 }
 
 TRAJECTORY_QUALITY_DEFAULTS = {
@@ -505,7 +507,7 @@ def _build_goal_trace_aliases(
 
 def _trajectory_state_keys_for_task(task: str | None) -> list[str]:
     task_name = normalize_task_name(task)
-    common = ["action"]
+    common = ["action", "pixels", "goal"]
     if task_name == "reacher":
         return [*common, "qpos", "qvel"]
     if task_name == "tworoom":
@@ -539,6 +541,7 @@ def run_evaluation_with_trajectory_quality(
     video_path: Path,
     task: str | None,
     quality_cfg: dict,
+    latent_encoder: Any | None = None,
 ) -> tuple[dict, dict]:
     ep_idx_arr = np.asarray(episodes_idx)
     start_steps_arr = np.asarray(start_steps)
@@ -699,6 +702,17 @@ def run_evaluation_with_trajectory_quality(
         successes_by_step=successes_by_step,
         truncate_after_success=bool(quality_cfg["truncate_after_success"]),
     )
+    latent_summary = None
+    latent_per_episode = None
+    if latent_encoder is not None and "pixels" in runtime_trace and "goal" in runtime_trace:
+        latent_array, goal_latent_array = latent_encoder(runtime_trace["pixels"], runtime_trace["goal"])
+        latent_summary, latent_per_episode = compute_latent_monotonicity(
+            latents=latent_array,
+            goal_latents=goal_latent_array,
+            successes_by_step=successes_by_step,
+            truncate_after_success=bool(quality_cfg["truncate_after_success"]),
+        )
+        summary.update(latent_summary)
     quality = {
         "summary": summary,
         "per_episode": per_episode,
@@ -706,6 +720,9 @@ def run_evaluation_with_trajectory_quality(
         "trace": runtime_trace,
         "successes_by_step": successes_by_step,
     }
+    if latent_summary is not None:
+        quality["latent_summary"] = latent_summary
+        quality["latent_per_episode"] = latent_per_episode
 
     if seeds is not None:
         assert np.unique(seeds).shape[0] == len(episodes_idx), "Some episode seeds are identical!"
@@ -1106,36 +1123,6 @@ def run(cfg: DictConfig):
             f"num_candidates={policy.num_candidates}"
         )
 
-    elif planner_type == "gc_idm":
-        if policy_name == "random":
-            raise ValueError("planner_type=gc_idm requires cfg.policy to point to a world-model checkpoint.")
-        gc_idm_bundle = cfg.get("gc_idm_bundle", None)
-        if gc_idm_bundle in [None, "", "null"]:
-            raise ValueError("planner_type=gc_idm requires cfg.gc_idm_bundle.")
-
-        model = swm.policy.AutoCostModel(cfg.policy)
-        model = model.to("cuda")
-        model = model.eval()
-        model.requires_grad_(False)
-        model.interpolate_pos_encoding = True
-        policy = GCIDMPolicy.from_bundle(
-            bundle_path=gc_idm_bundle,
-            world_model=model,
-            goal_offset_steps=int(cfg.eval.goal_offset_steps),
-            eval_budget=int(cfg.eval.eval_budget),
-            process=process,
-            transform=transform,
-            map_location="cpu",
-        )
-        print(
-            "[planner] "
-            f"type=gc_idm task={requested_task or config_name} config={config_name} "
-            f"policy={cfg.policy} bundle={gc_idm_bundle} "
-            f"goal_offset={int(cfg.eval.goal_offset_steps)} "
-            f"eval_budget={int(cfg.eval.eval_budget)} "
-            f"max_horizon={policy.max_horizon} action_dim={policy.action_dim}"
-        )
-
     elif planner_type == "diffusion":
         if policy_name == "random":
             raise ValueError("planner_type=diffusion requires cfg.policy to point to a world-model checkpoint.")
@@ -1265,7 +1252,7 @@ def run(cfg: DictConfig):
         raise ValueError(
             "Unsupported planner_type "
             f"'{planner_type}'. Expected one of: "
-            "random/mpc via planner_type=mpc, single_peak, multi_candidate, gc_idm, diffusion."
+            "random/mpc via planner_type=mpc, single_peak, multi_candidate, diffusion."
         )
 
     results_path = (
@@ -1362,6 +1349,10 @@ def run(cfg: DictConfig):
             "action_delta_l2_mean_mean",
             "action_jerk_l2_mean_mean",
             "steps_to_success_mean",
+            "latent_monotonicity_mean",
+            "latent_monotonic_step_fraction_mean",
+            "final_latent_goal_distance_mean",
+            "min_latent_goal_distance_mean",
         ]:
             if key in quality_summary:
                 print(f"[trajectory-quality] {key}={float(quality_summary[key]):.6f}")
@@ -1440,8 +1431,6 @@ def run(cfg: DictConfig):
         effective_replans_per_episode = int(
             math.ceil(int(cfg.eval.eval_budget) / int(policy.runtime_execute_steps))
         )
-    elif planner_type == "gc_idm":
-        effective_replans_per_episode = int(cfg.eval.eval_budget)
     elif planner_type == "mpc" and policy_name != "random":
         effective_replans_per_episode = int(
             math.ceil(
@@ -1568,16 +1557,6 @@ def run(cfg: DictConfig):
             f.write(f"single_peak_bundle: {cfg.single_peak_bundle}\n")
         if planner_type == "multi_candidate":
             f.write(f"multi_candidate_bundle: {cfg.multi_candidate_bundle}\n")
-        if planner_type == "gc_idm":
-            f.write(f"gc_idm_bundle: {cfg.gc_idm_bundle}\n")
-            f.write(f"task: {requested_task or config_name}\n")
-            f.write(f"config_name: {config_name}\n")
-            f.write(f"policy: {cfg.policy}\n")
-            f.write(f"goal_offset: {int(cfg.eval.goal_offset_steps)}\n")
-            f.write(f"eval_budget: {int(cfg.eval.eval_budget)}\n")
-            f.write(f"max_horizon: {policy.max_horizon}\n")
-            f.write(f"action_dim: {int(policy.action_dim)}\n")
-            f.write(f"replan_interval: 1\n")
         if planner_type == "diffusion":
             f.write(f"diffusion_bundle: {cfg.diffusion_bundle}\n")
             f.write(f"task: {policy.task or requested_task or config_name}\n")

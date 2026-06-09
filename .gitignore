@@ -11,6 +11,8 @@ __pycache__/
 outputs/
 lightning_logs/
 wandb/
+environment*.json
+requirements_frozen*.txt
 
 *.log
 *.tmp

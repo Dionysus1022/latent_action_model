@@ -305,59 +305,6 @@ class EvalPlannerConfigTests(unittest.TestCase):
             self.assertAlmostEqual(cfg.diffusion_refinement.grad_clip_norm, 1.0)
             self.assertNotIn("solver", cfg)
 
-    def test_gc_idm_configs_are_concrete_bundle_configs_without_solver(self) -> None:
-        import hydra
-        from eval import resolve_eval_profile_config
-
-        config_dir = str(Path(__file__).resolve().parents[1] / "config" / "eval")
-        expected = {
-            "cube": (
-                "/data/ykz/cube/lewm_epoch_27",
-                "/data/ykz/cube/gc_idm/gc_idm_best_bundle.pt",
-            ),
-            "pusht": (
-                "/data/ykz/pusht/lewm_epoch_100",
-                "/data/ykz/pusht/gc_idm/gc_idm_best_bundle.pt",
-            ),
-            "reacher": (
-                "/data/ykz/reacher/lewm_epoch_29",
-                "/data/ykz/reacher/gc_idm/gc_idm_best_bundle.pt",
-            ),
-            "tworoom": (
-                "/data/ykz/tworoom/lewm_epoch_67",
-                "/data/ykz/tworoom/gc_idm/gc_idm_best_bundle.pt",
-            ),
-        }
-
-        with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
-            for config_name, (policy_path, bundle_path) in expected.items():
-                cfg = resolve_eval_profile_config(
-                    hydra.compose(config_name=config_name, overrides=["eval_profile=gc_idm"])
-                )
-                self.assertEqual(cfg.planner_type, "gc_idm")
-                self.assertEqual(cfg.policy, policy_path)
-                self.assertEqual(cfg.gc_idm_bundle, bundle_path)
-                self.assertNotIn("solver", cfg)
-
-    def test_gc_idm_bundle_can_be_overridden_with_normal_hydra_syntax(self) -> None:
-        import hydra
-        from eval import resolve_eval_profile_config
-
-        config_dir = str(Path(__file__).resolve().parents[1] / "config" / "eval")
-        with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
-            cfg = resolve_eval_profile_config(
-                hydra.compose(
-                    config_name="reacher",
-                    overrides=[
-                        "eval_profile=gc_idm",
-                        "gc_idm_bundle=/tmp/gc_idm_best_bundle.pt",
-                    ],
-                )
-            )
-
-        self.assertEqual(cfg.planner_type, "gc_idm")
-        self.assertEqual(cfg.gc_idm_bundle, "/tmp/gc_idm_best_bundle.pt")
-
     def test_planning_stats_solver_records_solver_calls(self) -> None:
         from eval import PlanningStatsSolver, read_planning_stat
 

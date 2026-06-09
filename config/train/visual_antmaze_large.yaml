@@ -1,0 +1,20 @@
+defaults:
+  - lewm
+  - override data: visual_antmaze_large
+  - _self_
+
+output_model_name: lewm_visual_antmaze_large
+subdir: /data/ykz/antmaze/lewm_visual_antmaze_large
+
+wandb:
+  enabled: True
+  config:
+    entity: 3397765144-hust
+    project: ogbench-visual-antmaze-large
+    name: ${output_model_name}
+    id: ${output_model_name}
+    resume: allow
+    log_model: False
+
+wm:
+  action_dim: 8

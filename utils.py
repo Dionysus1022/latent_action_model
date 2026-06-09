@@ -43,11 +43,16 @@ def get_column_normalizer(dataset, source: str, target: str):
     """Get normalizer for a specific column in the dataset."""
     col_data = dataset.get_col_data(source)
     data = torch.from_numpy(np.array(col_data))
+    if not torch.is_floating_point(data):
+        data = data.float()
     data = data[~torch.isnan(data).any(dim=1)]
     mean = data.mean(0, keepdim=True).clone()
     std = data.std(0, keepdim=True).clone()
+    std = torch.where(std > 1e-6, std, torch.ones_like(std))
 
     def norm_fn(x):
+        if not torch.is_floating_point(x):
+            x = x.float()
         return ((x - mean) / std).float()
 
     normalizer = dt.transforms.WrapTorchTransform(norm_fn, source=source, target=target)

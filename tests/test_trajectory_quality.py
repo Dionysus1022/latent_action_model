@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from trajectory_quality import (
+    compute_latent_monotonicity,
     compute_task_goal_distances,
     compute_trajectory_quality,
 )
@@ -67,6 +68,25 @@ def test_compute_trajectory_quality_ignores_padding_after_termination():
     assert np.isclose(per_episode["min_goal_distance"][0], 0.0)
     assert per_episode["effective_length"][0] == 2
     assert np.isclose(summary["path_length_mean"], 1.0)
+
+
+def test_compute_latent_monotonicity_reports_fraction_of_goal_direct_steps():
+    latents = np.array(
+        [
+            [[3.0, 0.0], [2.0, 0.0], [1.0, 0.0], [0.0, 0.0]],
+            [[3.0, 0.0], [4.0, 0.0], [2.0, 0.0], [1.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    goal = np.zeros((2, 2), dtype=np.float32)
+
+    summary, per_episode = compute_latent_monotonicity(latents=latents, goal_latents=goal)
+
+    assert np.allclose(per_episode["latent_monotonicity"], [1.0, 0.0])
+    assert np.allclose(per_episode["latent_monotonic_step_fraction"], [1.0, 2.0 / 3.0])
+    assert np.isclose(summary["latent_monotonicity_mean"], 0.5)
+    assert np.isclose(summary["latent_monotonic_step_fraction_mean"], (1.0 + 2.0 / 3.0) / 2.0)
+    assert np.allclose(per_episode["final_latent_goal_distance"], [0.0, 1.0])
 
 
 def test_compute_task_goal_distances_for_reacher_and_tworoom():

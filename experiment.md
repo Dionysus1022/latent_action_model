@@ -45,8 +45,8 @@
 实验规模：
 
 ```text
-4 tasks x 3 methods x 3 seeds x 3 repeats = 108 eval runs
-108 runs x 50 episodes = 5400 evaluated episodes
+4 tasks x 6 methods x 3 seeds x 3 repeats = 216 eval runs
+216 runs x 50 episodes = 10800 evaluated episodes
 ```
 
 统计口径：
@@ -59,12 +59,12 @@
 
 ## 实验矩阵
 
-第一阶段总共 108 次 eval：
+第一阶段主仓库 comparison pipeline 总共 216 次 eval：
 
 | Dimension | Values |
 | --- | --- |
 | Tasks | `cube`, `pusht`, `reacher`, `tworoom` |
-| Methods | `mpc_cem`, `gc_idm`, `ours_full` |
+| Methods | `mpc_cem`, `ours_full`, `lgbs_gcidm`, `lgbs_mppi`, `lgbs_icem`, `lgbs_gradient` |
 | Seeds | `42`, `43`, `44` |
 | Repeats | `0`, `1`, `2` |
 
@@ -88,8 +88,15 @@
 | Method Name | Eval profile / Overrides | 说明 |
 | --- | --- | --- |
 | `mpc_cem` | `eval_profile=mpc` | LeWM + CEM online search baseline |
-| `gc_idm` | `eval_profile=gc_idm` | 论文复现 baseline |
 | `ours_full` | task-specific full diffusion config | 我们的完整方法，打开当前全部优化 |
+| `lgbs_gcidm` | external `eval_idm.py` | LGBS 论文的 GC-IDM amortized planner |
+| `lgbs_mppi` | external `eval_othersolvers.py --solver mppi` | LGBS 论文的 MPPI baseline |
+| `lgbs_icem` | external `eval_othersolvers.py --solver icem` | LGBS 论文的 iCEM baseline |
+| `lgbs_gradient` | external `eval_othersolvers.py --solver gradient` | LGBS 论文的 gradient planner baseline |
+
+LGBS 系列不通过本仓库 `eval.py` profile 运行；comparison pipeline 会直接调用
+`external/latent-geometry-beyond-search/eval_idm.py` 或 `eval_othersolvers.py`，
+并把统一 `[summary]`、`[planner-stats]`、`[trajectory-quality]` 输出并入同一张结果表。
 
 `ours_full` 不等价于裸 `eval_profile=diffusion`。它应该使用每个任务当前最强、最合理的 full-system 配置。
 
@@ -117,7 +124,7 @@ scripts/run_comparison_experiments.sh
 默认会执行：
 
 ```text
-4 tasks x 3 methods x 3 seeds x 3 repeats = 108 eval runs
+4 tasks x 6 methods x 3 seeds x 3 repeats = 216 eval runs
 ```
 
 脚本会显示总进度条，当前进度会包含 `task/method/seed/repeat`。输出位置：
@@ -165,18 +172,16 @@ scripts/run_comparison_experiments.sh \
   +dataset_h5=<dataset_h5>
 ```
 
-### GC-IDM
+### LGBS Paper Reproduction / Baselines
 
 ```bash
-./.venv/bin/python eval.py \
-  --config-name <task> \
-  eval_profile=gc_idm \
-  seed=<seed> \
-  eval.num_eval=50 \
-  trajectory_quality.enabled=true \
-  trajectory_quality.save_video=false \
-  +dataset_h5=<dataset_h5>
+scripts/run_lgbs_pipeline.sh --task <task> --stage all --seed <seed>
+scripts/run_comparison_experiments.sh --methods lgbs_gcidm,lgbs_mppi,lgbs_icem,lgbs_gradient
 ```
+
+注意：`lgbs_gcidm` 评估前必须已经有
+`/data/ykz/lgbs_repro/<task>/<task>_gcidm.pt`。如果不存在，先运行
+`scripts/run_lgbs_pipeline.sh --task <task> --stage train` 或 `--stage all`。
 
 ### Ours Full: Cube / TwoRoom / Reacher
 
@@ -260,8 +265,15 @@ scripts/run_comparison_experiments.sh \
 | `action_l2_mean_mean` | 动作幅值 |
 | `action_delta_l2_mean_mean` | 动作一阶变化 |
 | `action_jerk_l2_mean_mean` | 动作二阶变化，衡量平滑性 |
+| `latent_monotonicity_mean` | latent 到目标距离全程逐步不增加的 episode 比例，和 LGBS Table 4 的 latent monotonicity 对齐 |
+| `latent_monotonic_step_fraction_mean` | 每个 episode 内单调靠近 goal 的 step 比例，仅作诊断 |
+| `final_latent_goal_distance_mean` | 结束时 latent 到 goal latent 的距离 |
+| `min_latent_goal_distance_mean` | episode 内最近 goal latent 距离 |
 
-这部分用于和论文里的 trajectory quality / smoothness 口径对齐。成功率相同的时候，优先比较速度和 jerk。
+这部分用于和论文里的 trajectory quality / smoothness 口径对齐。LGBS Table 4
+明确报告 `Action Jerk` 和 `Latent Monotonicity`；我们的 `action_jerk_l2_mean_mean`
+对应 action jerk，`latent_monotonicity_mean` 对应 latent monotonicity。
+成功率相同的时候，优先比较速度、action jerk 和 latent monotonicity。
 
 ## Diffusion / Corrective 额外指标
 
@@ -314,7 +326,7 @@ Ours full 需要额外记录：
 - checkpoint selection rule: `best` / `last`
 - anchor construction method
 - diffusion planner 训练配置
-- GC-IDM 训练配置
+- GC-IDM 论文复现命令和训练配置
 - corrector 训练配置
 - 完整 eval command
 - log path

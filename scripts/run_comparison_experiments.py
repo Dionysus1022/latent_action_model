@@ -15,6 +15,13 @@ from typing import Any, Callable, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+LGBS_ROOT = REPO_ROOT / "external" / "latent-geometry-beyond-search"
+LGBS_SOLVER_METHODS = {
+    "lgbs_mppi": "mppi",
+    "lgbs_icem": "icem",
+    "lgbs_gradient": "gradient",
+}
+SUPPORTED_METHODS = ("mpc_cem", "ours_full", "lgbs_gcidm", *LGBS_SOLVER_METHODS.keys())
 
 SUMMARY_RE = re.compile(r"^\[summary\]\s+(?P<key>[a-zA-Z0-9_]+)=(?P<value>[^ ]+)s?$")
 TRAJECTORY_RE = re.compile(r"^\[trajectory-quality\]\s+(?P<key>[a-zA-Z0-9_]+)=(?P<value>[-+0-9.eE]+)$")
@@ -28,6 +35,7 @@ class TaskSpec:
     config_name: str
     dataset_h5: str
     ours_overrides: tuple[str, ...]
+    lgbs_checkpoint: str = ""
 
 
 @dataclass(frozen=True)
@@ -41,6 +49,8 @@ class ExperimentSpec:
     eval_budget: int = 50
     trajectory_quality: bool = True
     save_video: bool = False
+    lgbs_output_root: str = "/data/ykz/lgbs_repro"
+    lgbs_device: str = "cuda:0"
 
 
 @dataclass(frozen=True, order=True)
@@ -66,6 +76,7 @@ def default_experiment_spec() -> ExperimentSpec:
                     "diffusion_selection_mode=wm_only",
                     "diffusion_refinement.enabled=true",
                 ),
+                lgbs_checkpoint="/data/ykz/cube/lewm_epoch_27_object.ckpt",
             ),
             "pusht": TaskSpec(
                 config_name="pusht",
@@ -75,6 +86,7 @@ def default_experiment_spec() -> ExperimentSpec:
                     "diffusion_selection_mode=wm_only",
                     "diffusion_refinement.enabled=true",
                 ),
+                lgbs_checkpoint="/data/ykz/pusht/lewm_epoch_100_object.ckpt",
             ),
             "reacher": TaskSpec(
                 config_name="reacher",
@@ -84,6 +96,7 @@ def default_experiment_spec() -> ExperimentSpec:
                     "diffusion_selection_mode=wm_only",
                     "diffusion_refinement.enabled=true",
                 ),
+                lgbs_checkpoint="/data/ykz/reacher/lewm_epoch_29_object.ckpt",
             ),
             "tworoom": TaskSpec(
                 config_name="tworoom",
@@ -93,9 +106,10 @@ def default_experiment_spec() -> ExperimentSpec:
                     "diffusion_selection_mode=wm_only",
                     "diffusion_refinement.enabled=true",
                 ),
+                lgbs_checkpoint="/data/ykz/tworoom/lewm_epoch_67_object.ckpt",
             ),
         },
-        methods=("mpc_cem", "gc_idm", "ours_full"),
+        methods=SUPPORTED_METHODS,
         seeds=(42, 43, 44),
         repeats=(0, 1, 2),
     )
@@ -115,6 +129,72 @@ def build_eval_command(run: EvalRun, *, spec: ExperimentSpec, python_bin: Path) 
     if run.task not in spec.tasks:
         raise KeyError(f"Unknown task '{run.task}'.")
     task = spec.tasks[run.task]
+    if not task.dataset_h5:
+        raise ValueError(f"Task '{run.task}' must define an explicit dataset_h5.")
+
+    if run.method == "lgbs_gcidm":
+        if not task.lgbs_checkpoint:
+            raise ValueError(f"Task '{run.task}' must define lgbs_checkpoint for {run.method}.")
+        idm_path = Path(spec.lgbs_output_root) / run.task / f"{run.task}_gcidm.pt"
+        command = [
+            str(python_bin),
+            str(LGBS_ROOT / "eval_idm.py"),
+            "--dataset",
+            run.task,
+            "--checkpoint",
+            task.lgbs_checkpoint,
+            "--dataset-h5",
+            task.dataset_h5,
+            "--idm",
+            str(idm_path),
+            "--num-eval",
+            str(int(spec.eval_num_eval)),
+            "--goal-offset",
+            str(int(spec.eval_goal_offset_steps)),
+            "--eval-budget",
+            str(int(spec.eval_budget)),
+            "--seed",
+            str(int(run.seed)),
+            "--device",
+            str(spec.lgbs_device),
+        ]
+        if bool(spec.trajectory_quality):
+            command.append("--trajectory-quality")
+        if bool(spec.save_video):
+            command.append("--trajectory-quality-save-video")
+        return command
+
+    if run.method in LGBS_SOLVER_METHODS:
+        if not task.lgbs_checkpoint:
+            raise ValueError(f"Task '{run.task}' must define lgbs_checkpoint for {run.method}.")
+        command = [
+            str(python_bin),
+            str(LGBS_ROOT / "eval_othersolvers.py"),
+            "--solver",
+            LGBS_SOLVER_METHODS[run.method],
+            "--dataset",
+            run.task,
+            "--checkpoint",
+            task.lgbs_checkpoint,
+            "--dataset-h5",
+            task.dataset_h5,
+            "--num-eval",
+            str(int(spec.eval_num_eval)),
+            "--goal-offset",
+            str(int(spec.eval_goal_offset_steps)),
+            "--eval-budget",
+            str(int(spec.eval_budget)),
+            "--seed",
+            str(int(run.seed)),
+            "--device",
+            str(spec.lgbs_device),
+        ]
+        if bool(spec.trajectory_quality):
+            command.append("--trajectory-quality")
+        if bool(spec.save_video):
+            command.append("--trajectory-quality-save-video")
+        return command
+
     command = [
         str(python_bin),
         str(REPO_ROOT / "eval.py"),
@@ -123,12 +203,10 @@ def build_eval_command(run: EvalRun, *, spec: ExperimentSpec, python_bin: Path) 
     ]
     if run.method == "mpc_cem":
         command.append("eval_profile=mpc")
-    elif run.method == "gc_idm":
-        command.append("eval_profile=gc_idm")
     elif run.method == "ours_full":
         command.extend(task.ours_overrides)
     else:
-        raise ValueError(f"Unsupported method '{run.method}'.")
+        raise ValueError(f"Unsupported method '{run.method}'. Supported methods: {SUPPORTED_METHODS}")
 
     command.extend(
         [
@@ -140,8 +218,6 @@ def build_eval_command(run: EvalRun, *, spec: ExperimentSpec, python_bin: Path) 
             f"trajectory_quality.save_video={str(bool(spec.save_video)).lower()}",
         ]
     )
-    if not task.dataset_h5:
-        raise ValueError(f"Task '{run.task}' must define an explicit dataset_h5.")
     command.append(f"+dataset_h5={task.dataset_h5}")
     return command
 
@@ -195,6 +271,8 @@ def parse_eval_log_text(text: str) -> dict[str, Any]:
                         "type",
                         "planner_type",
                         "policy",
+                        "solver",
+                        "idm",
                         "bundle",
                         "diffusion_bundle",
                         "selection_mode",
@@ -208,6 +286,10 @@ def parse_eval_log_text(text: str) -> dict[str, Any]:
                         "refinement_step_size",
                     }:
                         metric_key = "planner_type" if key == "type" else key
+                        if metric_key == "solver":
+                            metric_key = "lgbs_solver"
+                        elif metric_key == "idm":
+                            metric_key = "lgbs_idm_path"
                         if metric_key == "refinement_enabled":
                             metric_key = "diffusion_refinement_enabled"
                         elif metric_key == "refinement_steps":
@@ -304,6 +386,16 @@ def parse_eval_log_text(text: str) -> dict[str, Any]:
                     }:
                         metric_key = "diffusion_selection_mode" if key == "mode" else key
                         _set_metric(metrics, metric_key, value)
+            elif line.startswith("[lgbs-stats]"):
+                mapping = {
+                    "solver": "lgbs_solver",
+                    "idm": "lgbs_idm_path",
+                    "ms_per_episode": "lgbs_ms_per_episode",
+                    "ms_per_plan": "lgbs_ms_per_plan",
+                    "total_time": "evaluation_time_sec",
+                }
+                for key, value in KEY_VALUE_RE.findall(line):
+                    _set_metric(metrics, mapping.get(key, key), value)
     return metrics
 
 
@@ -366,6 +458,8 @@ RAW_COLUMNS = [
     "repeat",
     "planner_type",
     "policy",
+    "lgbs_solver",
+    "lgbs_idm_path",
     "dataset_h5",
     "diffusion_bundle",
     "diffusion_selection_mode",
@@ -374,6 +468,8 @@ RAW_COLUMNS = [
     "evaluation_time_sec",
     "planning_time_total_sec",
     "avg_planning_time_sec",
+    "lgbs_ms_per_episode",
+    "lgbs_ms_per_plan",
     "global_planning_calls",
     "effective_replans_per_episode",
     "final_goal_distance_mean",
@@ -384,6 +480,10 @@ RAW_COLUMNS = [
     "action_l2_mean_mean",
     "action_delta_l2_mean_mean",
     "action_jerk_l2_mean_mean",
+    "latent_monotonicity_mean",
+    "latent_monotonic_step_fraction_mean",
+    "final_latent_goal_distance_mean",
+    "min_latent_goal_distance_mean",
     "diffusion_runtime_execute_steps",
     "diffusion_num_candidates",
     "diffusion_truncation_steps",
@@ -460,10 +560,32 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> No
             writer.writerow({key: row.get(key, "") for key in columns})
 
 
+def _coerce_int(value: Any) -> int | Any:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            try:
+                return int(stripped)
+            except ValueError:
+                return value
+    return value
+
+
+def _normalize_raw_row_types(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    for key in ("seed", "repeat", "returncode", "dry_run"):
+        if key in normalized:
+            normalized[key] = _coerce_int(normalized[key])
+    return normalized
+
+
 def _group_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> dict[tuple[Any, ...], list[dict[str, Any]]]:
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in rows:
-        grouped.setdefault(tuple(row[key] for key in keys), []).append(row)
+        normalized = _normalize_raw_row_types(row)
+        grouped.setdefault(tuple(normalized[key] for key in keys), []).append(normalized)
     return grouped
 
 
@@ -492,6 +614,11 @@ def build_seed_summary_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, An
                 "steps_to_success_mean": _mean(row.get("steps_to_success_mean") for row in rows),
                 "path_length_mean": _mean(row.get("path_length_mean") for row in rows),
                 "straight_line_ratio_mean": _mean(row.get("straight_line_ratio_mean") for row in rows),
+                "latent_monotonicity_mean": _mean(row.get("latent_monotonicity_mean") for row in rows),
+                "latent_monotonicity_std": _std(row.get("latent_monotonicity_mean") for row in rows),
+                "latent_monotonic_step_fraction_mean": _mean(row.get("latent_monotonic_step_fraction_mean") for row in rows),
+                "final_latent_goal_distance_mean": _mean(row.get("final_latent_goal_distance_mean") for row in rows),
+                "min_latent_goal_distance_mean": _mean(row.get("min_latent_goal_distance_mean") for row in rows),
             }
         )
     return output
@@ -539,6 +666,10 @@ def build_final_summary_rows(seed_rows: list[dict[str, Any]]) -> list[dict[str, 
                 "action_l2_mean_mean": _mean(row.get("action_l2_mean_mean") for row in rows),
                 "action_delta_l2_mean_mean": _mean(row.get("action_delta_l2_mean_mean") for row in rows),
                 "action_jerk_l2_mean_mean": _mean(row.get("action_jerk_l2_mean_mean") for row in rows),
+                "latent_monotonicity_mean": _mean(row.get("latent_monotonicity_mean") for row in rows),
+                "latent_monotonic_step_fraction_mean": _mean(row.get("latent_monotonic_step_fraction_mean") for row in rows),
+                "final_latent_goal_distance_mean": _mean(row.get("final_latent_goal_distance_mean") for row in rows),
+                "min_latent_goal_distance_mean": _mean(row.get("min_latent_goal_distance_mean") for row in rows),
             }
         )
     return output
@@ -558,8 +689,8 @@ def write_result_markdown(
         "",
         "## Raw Runs",
         "",
-        "| Task | Method | Seed | Repeat | Success Rate | Eval Time Sec | Planning Total Sec | Avg Planning Sec | Calls | Replans/Ep | Final Goal Dist | Min Goal Dist | Steps To Success | Path Length | Straight Ratio | Action L2 | Action Delta | Action Jerk | Log Path |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Task | Method | Seed | Repeat | Success Rate | Eval Time Sec | Planning Total Sec | Avg Planning Sec | Calls | Replans/Ep | Final Goal Dist | Min Goal Dist | Steps To Success | Path Length | Straight Ratio | Action L2 | Action Delta | Action Jerk | Latent Mono | Log Path |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in raw_rows:
         lines.append(
@@ -585,6 +716,7 @@ def write_result_markdown(
                     "action_l2_mean_mean",
                     "action_delta_l2_mean_mean",
                     "action_jerk_l2_mean_mean",
+                    "latent_monotonicity_mean",
                     "log_path",
                 ]
             )
@@ -596,8 +728,8 @@ def write_result_markdown(
             "",
             "## Seed Summary",
             "",
-            "| Task | Method | Seed | Success Rate Mean | Success Rate Std | Eval Time Mean | Eval Time Std | Planning Time Mean | Planning Time Std | Action Jerk Mean | Action Jerk Std |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Task | Method | Seed | Success Rate Mean | Success Rate Std | Eval Time Mean | Eval Time Std | Planning Time Mean | Planning Time Std | Action Jerk Mean | Action Jerk Std | Latent Mono Mean | Latent Mono Std |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in seed_rows:
@@ -617,6 +749,8 @@ def write_result_markdown(
                     "planning_time_total_sec_std",
                     "action_jerk_l2_mean_mean",
                     "action_jerk_l2_mean_std",
+                    "latent_monotonicity_mean",
+                    "latent_monotonicity_std",
                 ]
             )
             + " |"
@@ -627,8 +761,8 @@ def write_result_markdown(
             "",
             "## Final Summary",
             "",
-            "| Task | Method | Success Rate Mean | Success Rate Std | Eval Time Mean | Eval Time Std | Planning Time Mean | Planning Time Std | Speedup vs MPC | Planning Speedup vs MPC | Final Goal Dist Mean | Min Goal Dist Mean | Steps To Success | Path Length | Straight Ratio | Action L2 | Action Delta | Action Jerk |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Task | Method | Success Rate Mean | Success Rate Std | Eval Time Mean | Eval Time Std | Planning Time Mean | Planning Time Std | Speedup vs MPC | Planning Speedup vs MPC | Final Goal Dist Mean | Min Goal Dist Mean | Steps To Success | Path Length | Straight Ratio | Action L2 | Action Delta | Action Jerk | Latent Mono |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in final_rows:
@@ -655,6 +789,7 @@ def write_result_markdown(
                     "action_l2_mean_mean",
                     "action_delta_l2_mean_mean",
                     "action_jerk_l2_mean_mean",
+                    "latent_monotonicity_mean",
                 ]
             )
             + " |"
@@ -676,7 +811,7 @@ def _load_existing_raw_rows(csv_path: Path) -> list[dict[str, Any]]:
     if not csv_path.exists():
         return []
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle))
+        return [_normalize_raw_row_types(row) for row in csv.DictReader(handle)]
 
 
 def _row_is_complete_for_command(row: dict[str, Any], command: list[str]) -> bool:
@@ -685,6 +820,24 @@ def _row_is_complete_for_command(row: dict[str, Any], command: list[str]) -> boo
         and str(row.get("returncode", "")) == "0"
         and str(row.get("dry_run", "")).lower() not in {"1", "true", "yes"}
     )
+
+
+def _recover_successful_row_from_log(row: dict[str, Any], command: list[str]) -> dict[str, Any] | None:
+    if row.get("command") != " ".join(command):
+        return None
+    if str(row.get("dry_run", "")).lower() in {"1", "true", "yes"}:
+        return None
+    log_path = Path(str(row.get("log_path", "")))
+    if not log_path.exists():
+        return None
+    metrics = parse_eval_log_file(log_path)
+    if "success_rate" not in metrics or "evaluation_time_sec" not in metrics:
+        return None
+    recovered = _normalize_raw_row_types(row)
+    recovered.update(metrics)
+    recovered["returncode"] = 0
+    recovered["dry_run"] = 0
+    return recovered
 
 
 def run_experiments(
@@ -704,11 +857,19 @@ def run_experiments(
     seed_csv = output_root / "seed_summary.csv"
     final_csv = output_root / "final_summary.csv"
     raw_rows = _load_existing_raw_rows(raw_csv) if not force else []
+    runs = build_run_matrix(spec)
+    current_keys = {
+        (run.task, run.method, str(run.seed), str(run.repeat))
+        for run in runs
+    }
+    raw_rows = [
+        row for row in raw_rows
+        if (row.get("task"), row.get("method"), str(row.get("seed")), str(row.get("repeat"))) in current_keys
+    ]
     existing = {
         (row["task"], row["method"], str(row["seed"]), str(row["repeat"])): row
         for row in raw_rows
     }
-    runs = build_run_matrix(spec)
     printer = ProgressPrinter(enabled=progress)
     completed = 0
     skipped = 0
@@ -722,6 +883,25 @@ def run_experiments(
             skipped += 1
             printer.update(index, len(runs), run, "skipped")
             continue
+        if existing_row is not None and not force:
+            recovered_row = _recover_successful_row_from_log(existing_row, command)
+            if recovered_row is not None:
+                raw_rows = [
+                    row for row in raw_rows
+                    if (row["task"], row["method"], str(row["seed"]), str(row["repeat"])) != key
+                ]
+                raw_rows.append(recovered_row)
+                existing[key] = recovered_row
+                skipped += 1
+                _write_outputs(
+                    raw_rows=raw_rows,
+                    raw_csv=raw_csv,
+                    seed_csv=seed_csv,
+                    final_csv=final_csv,
+                    result_path=result_path,
+                )
+                printer.update(index, len(runs), run, "recovered")
+                continue
 
         printer.update(index - 1, len(runs), run, "running")
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -793,6 +973,13 @@ def run_experiments(
             raise subprocess.CalledProcessError(returncode, command)
         printer.update(index, len(runs), run, "done")
 
+    _write_outputs(
+        raw_rows=raw_rows,
+        raw_csv=raw_csv,
+        seed_csv=seed_csv,
+        final_csv=final_csv,
+        result_path=result_path,
+    )
     seed_rows = build_seed_summary_rows(raw_rows)
     final_rows = build_final_summary_rows(seed_rows)
     return {
@@ -831,6 +1018,11 @@ def _write_outputs(
             "planning_time_total_sec_std",
             "action_jerk_l2_mean_mean",
             "action_jerk_l2_mean_std",
+            "latent_monotonicity_mean",
+            "latent_monotonicity_std",
+            "latent_monotonic_step_fraction_mean",
+            "final_latent_goal_distance_mean",
+            "min_latent_goal_distance_mean",
             "action_l2_mean_mean",
             "action_l2_mean_std",
             "action_delta_l2_mean_mean",
@@ -864,6 +1056,10 @@ def _write_outputs(
             "action_l2_mean_mean",
             "action_delta_l2_mean_mean",
             "action_jerk_l2_mean_mean",
+            "latent_monotonicity_mean",
+            "latent_monotonic_step_fraction_mean",
+            "final_latent_goal_distance_mean",
+            "min_latent_goal_distance_mean",
         ],
     )
     write_result_markdown(
@@ -888,10 +1084,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--result-path", type=Path, default=Path("result.md"))
     parser.add_argument("--python-bin", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--tasks", default="cube,pusht,reacher,tworoom")
-    parser.add_argument("--methods", default="mpc_cem,gc_idm,ours_full")
+    parser.add_argument("--methods", default=",".join(SUPPORTED_METHODS))
     parser.add_argument("--seeds", default="42,43,44")
     parser.add_argument("--repeats", default="0,1,2")
     parser.add_argument("--eval-num-eval", type=int, default=50)
+    parser.add_argument("--lgbs-output-root", default="/data/ykz/lgbs_repro")
+    parser.add_argument("--lgbs-device", default="cuda:0")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="Re-run rows already present in raw_runs.csv.")
     parser.add_argument("--no-progress", action="store_true")
@@ -900,6 +1098,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pusht-dataset-h5", default="/data/ykz/pusht/pusht_expert_train.h5")
     parser.add_argument("--reacher-dataset-h5", default="/data/ykz/reacher/reacher.h5")
     parser.add_argument("--tworoom-dataset-h5", default="/data/ykz/tworoom/tworoom.h5")
+    parser.add_argument("--cube-lgbs-checkpoint", default="/data/ykz/cube/lewm_epoch_27_object.ckpt")
+    parser.add_argument("--pusht-lgbs-checkpoint", default="/data/ykz/pusht/lewm_epoch_100_object.ckpt")
+    parser.add_argument("--reacher-lgbs-checkpoint", default="/data/ykz/reacher/lewm_epoch_29_object.ckpt")
+    parser.add_argument("--tworoom-lgbs-checkpoint", default="/data/ykz/tworoom/lewm_epoch_67_object.ckpt")
     return parser.parse_args(argv)
 
 
@@ -917,32 +1119,41 @@ def spec_from_args(args: argparse.Namespace) -> ExperimentSpec:
             config_name="cube",
             dataset_h5=str(args.cube_dataset_h5),
             ours_overrides=default.tasks["cube"].ours_overrides,
+            lgbs_checkpoint=str(args.cube_lgbs_checkpoint),
         ),
         "pusht": TaskSpec(
             config_name="pusht",
             dataset_h5=str(args.pusht_dataset_h5),
             ours_overrides=pusht_ours,
+            lgbs_checkpoint=str(args.pusht_lgbs_checkpoint),
         ),
         "reacher": TaskSpec(
             config_name="reacher",
             dataset_h5=str(args.reacher_dataset_h5),
             ours_overrides=default.tasks["reacher"].ours_overrides,
+            lgbs_checkpoint=str(args.reacher_lgbs_checkpoint),
         ),
         "tworoom": TaskSpec(
             config_name="tworoom",
             dataset_h5=str(args.tworoom_dataset_h5),
             ours_overrides=default.tasks["tworoom"].ours_overrides,
+            lgbs_checkpoint=str(args.tworoom_lgbs_checkpoint),
         ),
     }
     missing_tasks = set(selected_tasks) - set(task_specs)
     if missing_tasks:
         raise ValueError(f"Unsupported tasks: {sorted(missing_tasks)}")
+    unsupported_methods = set(selected_methods) - set(SUPPORTED_METHODS)
+    if unsupported_methods:
+        raise ValueError(f"Unsupported methods: {sorted(unsupported_methods)}. Supported: {SUPPORTED_METHODS}")
     return ExperimentSpec(
         tasks={task: task_specs[task] for task in selected_tasks},
         methods=selected_methods,
         seeds=parse_csv_ints(args.seeds),
         repeats=parse_csv_ints(args.repeats),
         eval_num_eval=int(args.eval_num_eval),
+        lgbs_output_root=str(args.lgbs_output_root),
+        lgbs_device=str(args.lgbs_device),
     )
 
 
