@@ -1,6 +1,0 @@
-name: reacher
-data_root: /data/ykz/reacher
-planner_dataset_path: /data/ykz/reacher/diffusion_pipeline/reacher_planner_dataset.pt
-diffusion_bundle_path: /data/ykz/reacher/diffusion_pipeline/reacher_diffusion_k128_200000/diffusion_planner_best_bundle.pt
-consistency_output_dir: /data/ykz/reacher/diffusion_pipeline/consistency
-wm_policy: /data/ykz/reacher/lewm_epoch_20

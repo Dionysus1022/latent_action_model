@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - /reacher
-  - _self_
-
-eval_profile: mpc

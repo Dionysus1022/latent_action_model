@@ -4,7 +4,7 @@
 
 **Goal:** Add trajectory-quality metrics to `eval.py` and validate them on cube, pusht, tworoom, and reacher.
 
-**Architecture:** Keep metric math in a small standalone module, then add an optional trajectory-recording evaluation path in `eval.py`. Reuse the existing dataset-conditioned reset/callable logic and preserve the existing success-rate semantics.
+**Architecture:** Keep metric math in a small evaluation module, then add an optional trajectory-recording evaluation path in `eval.py`. Reuse the existing dataset-conditioned reset/callable logic and preserve the existing success-rate semantics.
 
 **Tech Stack:** Python, NumPy, Hydra/OmegaConf, stable_worldmodel, pytest.
 
@@ -13,7 +13,7 @@
 ### Task 1: Pure Trajectory Metrics
 
 **Files:**
-- Create: `trajectory_quality.py`
+- Create: `evaluation/trajectory_quality.py`
 - Create: `tests/test_trajectory_quality.py`
 
 - [ ] Write failing tests for straight paths, action smoothness, and task-specific goal distances.

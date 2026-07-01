@@ -12,7 +12,7 @@ from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from training.utils import ModelObjectCallBack, get_column_normalizer, get_img_preprocessor
 
 
 def build_hdf5_dataset(cfg):

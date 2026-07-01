@@ -26,7 +26,6 @@ SUPPORTED_METHODS = ("mpc_cem", "ours_full", "lgbs_gcidm", *LGBS_SOLVER_METHODS.
 SUMMARY_RE = re.compile(r"^\[summary\]\s+(?P<key>[a-zA-Z0-9_]+)=(?P<value>[^ ]+)s?$")
 TRAJECTORY_RE = re.compile(r"^\[trajectory-quality\]\s+(?P<key>[a-zA-Z0-9_]+)=(?P<value>[-+0-9.eE]+)$")
 PLANNER_RE = re.compile(r"^\[planner-stats\]\s+(?P<key>[a-zA-Z0-9_]+)=(?P<value>[-+0-9.eE]+)$")
-CORRECTIVE_RE = re.compile(r"^\[corrective-stats\]\s+(?P<key>[a-zA-Z0-9_]+)=(?P<value>[-+0-9.eE]+)$")
 KEY_VALUE_RE = re.compile(r"(?P<key>[a-zA-Z0-9_]+)=(?P<value>[^ ]+)")
 
 
@@ -82,7 +81,7 @@ def default_experiment_spec() -> ExperimentSpec:
                 config_name="pusht",
                 dataset_h5="/data/ykz/pusht/pusht_expert_train.h5",
                 ours_overrides=(
-                    "eval_profile=corrective_learned",
+                    "eval_profile=diffusion",
                     "diffusion_selection_mode=wm_only",
                     "diffusion_refinement.enabled=true",
                 ),
@@ -218,7 +217,6 @@ def build_eval_command(run: EvalRun, *, spec: ExperimentSpec, python_bin: Path) 
             f"trajectory_quality.save_video={str(bool(spec.save_video)).lower()}",
         ]
     )
-    command.append(f"+dataset_h5={task.dataset_h5}")
     return command
 
 
@@ -258,7 +256,7 @@ def parse_eval_log_text(text: str) -> dict[str, Any]:
         line = raw_line.strip()
         if not line:
             continue
-        for regex in (SUMMARY_RE, TRAJECTORY_RE, PLANNER_RE, CORRECTIVE_RE):
+        for regex in (SUMMARY_RE, TRAJECTORY_RE, PLANNER_RE):
             match = regex.match(line)
             if match is not None:
                 _set_metric(metrics, match.group("key"), match.group("value"))
@@ -314,46 +312,6 @@ def parse_eval_log_text(text: str) -> dict[str, Any]:
                 for key, metric_key in mapping.items():
                     if key in pairs:
                         _set_metric(metrics, metric_key, pairs[key])
-            elif line.startswith("[corrective]"):
-                pairs = dict(KEY_VALUE_RE.findall(line))
-                mapping = {
-                    "mode": "corrective_mode",
-                    "correction_interval": "corrective_correction_interval",
-                    "effective_error_interval": "corrective_effective_error_interval",
-                    "effective_execute_horizon": "corrective_effective_execute_horizon",
-                    "error_threshold": "corrective_error_threshold",
-                    "trigger_stat": "corrective_trigger_stat",
-                    "trigger_quantile": "corrective_trigger_quantile",
-                    "trigger_scope": "corrective_trigger_scope",
-                    "error_metric": "corrective_error_metric",
-                    "corrector_path": "corrector_path",
-                }
-                for key, metric_key in mapping.items():
-                    if key in pairs:
-                        _set_metric(metrics, metric_key, pairs[key])
-            elif line.startswith("[corrective-stats]"):
-                for key, value in KEY_VALUE_RE.findall(line):
-                    _set_metric(metrics, key, value)
-            elif line.startswith("[corrective-summary]"):
-                pairs = dict(KEY_VALUE_RE.findall(line))
-                if "prediction_error_count" in pairs:
-                    _set_metric(metrics, "prediction_error_count", pairs["prediction_error_count"])
-                if "episode_mean_count" in pairs:
-                    _set_metric(metrics, "prediction_error_episode_mean_count", pairs["episode_mean_count"])
-                if "mean" in pairs:
-                    _set_metric(metrics, "prediction_error_mean", pairs["mean"])
-                if "max" in pairs:
-                    _set_metric(metrics, "prediction_error_max", pairs["max"])
-                if "cohens_d" in pairs:
-                    _set_metric(metrics, "prediction_error_cohens_d_fail_vs_success", pairs["cohens_d"])
-                if "success_mean" in pairs:
-                    _set_metric(metrics, "successful_prediction_error_mean", pairs["success_mean"])
-                if "failure_mean" in pairs:
-                    _set_metric(metrics, "failed_prediction_error_mean", pairs["failure_mean"])
-                if "fail_minus_success" in pairs:
-                    _set_metric(metrics, "prediction_error_fail_minus_success", pairs["fail_minus_success"])
-                if "fail_success_ratio" in pairs:
-                    _set_metric(metrics, "prediction_error_fail_success_ratio", pairs["fail_success_ratio"])
             elif line.startswith("[refinement-summary]"):
                 pairs = dict(KEY_VALUE_RE.findall(line))
                 mapping = {
@@ -515,35 +473,6 @@ RAW_COLUMNS = [
     "refinement_goal_before",
     "refinement_goal_after",
     "refinement_delta_norm",
-    "corrective_mode",
-    "corrective_correction_interval",
-    "corrective_effective_error_interval",
-    "corrective_effective_execute_horizon",
-    "corrective_error_threshold",
-    "corrective_trigger_stat",
-    "corrective_trigger_quantile",
-    "corrective_trigger_scope",
-    "corrective_error_metric",
-    "corrector_path",
-    "corrective_check_count",
-    "corrective_replan_count",
-    "corrective_replan_rate",
-    "corrective_correction_count",
-    "mean_prediction_error_before_replan",
-    "max_prediction_error_before_replan",
-    "mean_correction_norm",
-    "mean_action_delta_norm",
-    "correction_time_total_sec",
-    "avg_correction_time_sec",
-    "prediction_error_count",
-    "prediction_error_episode_mean_count",
-    "prediction_error_mean",
-    "prediction_error_max",
-    "successful_prediction_error_mean",
-    "failed_prediction_error_mean",
-    "prediction_error_fail_minus_success",
-    "prediction_error_fail_success_ratio",
-    "prediction_error_cohens_d_fail_vs_success",
     "log_path",
     "command",
     "returncode",
@@ -1093,7 +1022,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="Re-run rows already present in raw_runs.csv.")
     parser.add_argument("--no-progress", action="store_true")
-    parser.add_argument("--pusht-ours-profile", choices=["corrective_learned", "corrective_replan"], default="corrective_learned")
     parser.add_argument("--cube-dataset-h5", default="/data/ykz/cube/cube_single_expert.h5")
     parser.add_argument("--pusht-dataset-h5", default="/data/ykz/pusht/pusht_expert_train.h5")
     parser.add_argument("--reacher-dataset-h5", default="/data/ykz/reacher/reacher.h5")
@@ -1109,11 +1037,6 @@ def spec_from_args(args: argparse.Namespace) -> ExperimentSpec:
     default = default_experiment_spec()
     selected_tasks = parse_csv_strings(args.tasks)
     selected_methods = parse_csv_strings(args.methods)
-    pusht_ours = (
-        f"eval_profile={args.pusht_ours_profile}",
-        "diffusion_selection_mode=wm_only",
-        "diffusion_refinement.enabled=true",
-    )
     task_specs = {
         "cube": TaskSpec(
             config_name="cube",
@@ -1124,7 +1047,7 @@ def spec_from_args(args: argparse.Namespace) -> ExperimentSpec:
         "pusht": TaskSpec(
             config_name="pusht",
             dataset_h5=str(args.pusht_dataset_h5),
-            ours_overrides=pusht_ours,
+            ours_overrides=default.tasks["pusht"].ours_overrides,
             lgbs_checkpoint=str(args.pusht_lgbs_checkpoint),
         ),
         "reacher": TaskSpec(

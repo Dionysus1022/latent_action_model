@@ -1,738 +1,332 @@
 # LeWM Diffusion Planner
 
-本仓库基于 LeWorldModel (LeWM)，当前重点是把原本较慢的 CEM/MPC test-time planning
-蒸馏成可学习的 action-chunk planner。主要流程是：
+本仓库当前主线是把 LeWM world model 上的在线规划，整理成可复现的
+diffusion action-chunk planner。代码保留三条需要继续系统测试的路径：
+
+1. 已经大规模测试过的 diffusion 主线模型。
+2. Reacher H=10 的 `top16-wmcost` score-head 筛选模型。
+3. Reacher 上不同 action horizon `H` 的 backbone 训练与评估。
+
+核心流程如下：
 
 ```text
 raw HDF5 demonstrations
-  -> LeWM teacher rollout / CEM planner labels
   -> planner dataset: z_cur, z_goal, teacher_plan
-  -> action anchor K-means
-  -> anchor-conditioned truncated diffusion planner
+  -> K-means action anchors
+  -> anchor-conditioned truncated diffusion backbone
+  -> optional score-head fine-tuning
   -> eval.py closed-loop evaluation
-  -> optional consistency distillation for 1-2 step inference
 ```
-
-当前支持任务：
-
-- PushT
-- TwoRoom
-- Reacher
-- Cube
-
-## 环境
-
-项目默认使用本地虚拟环境：
-
-```bash
-./.venv/bin/python -m pytest --version
-```
-
-如果需要重新安装依赖：
-
-```bash
-./.venv/bin/python -m pip install -r requirements.txt
-```
-
-常用依赖包括 Hydra/OmegaConf、PyTorch、stable_worldmodel、scikit-learn 等。
-
-## OGBench 视觉数据
-
-当前 OGBench 新数据集先接入 world model 训练数据准备，不直接接入
-`eval.py` 闭环评估。原因是训练只需要 `pixels + action` 的 HDF5 序列，而评估还需要
-stable_worldmodel 环境封装、reset/goal 构造和成功判定。
-
-已下载的视觉版 NPZ 默认放在：
-
-```text
-/data/ykz/scene/visual-scene-play-v0.npz
-/data/ykz/puzzle/visual-puzzle-3x3-play-v0.npz
-/data/ykz/antmaze/visual-antmaze-large-navigate-v0.npz
-```
-
-这些文件的 `observations` 是 `uint8 NHWC 64x64x3`。LeWM 训练脚本需要 HDF5
-里的 key 叫 `pixels`，所以要先转换：
-
-```bash
-./.venv/bin/python scripts/convert_ogbench_npz_to_hdf5.py \
-  --input-npz /data/ykz/scene/visual-scene-play-v0.npz \
-  --output-h5 /data/ykz/scene/visual-scene-play-v0.h5 \
-  --dataset-name visual-scene-play-v0 \
-  --observation-output-key pixels
-
-./.venv/bin/python scripts/convert_ogbench_npz_to_hdf5.py \
-  --input-npz /data/ykz/puzzle/visual-puzzle-3x3-play-v0.npz \
-  --output-h5 /data/ykz/puzzle/visual-puzzle-3x3-play-v0.h5 \
-  --dataset-name visual-puzzle-3x3-play-v0 \
-  --observation-output-key pixels
-
-./.venv/bin/python scripts/convert_ogbench_npz_to_hdf5.py \
-  --input-npz /data/ykz/antmaze/visual-antmaze-large-navigate-v0.npz \
-  --output-h5 /data/ykz/antmaze/visual-antmaze-large-navigate-v0.h5 \
-  --dataset-name visual-antmaze-large-navigate-v0 \
-  --observation-output-key pixels
-```
-
-转换后可以训练 LeWM world model：
-
-```bash
-./.venv/bin/python train.py --config-name visual_scene
-./.venv/bin/python train.py --config-name visual_puzzle_3x3
-./.venv/bin/python train.py --config-name visual_antmaze_large
-```
-
-对应配置在：
-
-```text
-config/train/visual_scene.yaml
-config/train/visual_puzzle_3x3.yaml
-config/train/visual_antmaze_large.yaml
-config/train/data/visual_scene.yaml
-config/train/data/visual_puzzle_3x3.yaml
-config/train/data/visual_antmaze_large.yaml
-```
-
-三个配置都已经设置独立的 wandb project，并把 checkpoint 默认写到各自的
-`/data/ykz/<task>/lewm_visual_*` 目录。
 
 ## 目录结构
 
 ```text
-config/diffusion/              # diffusion planner 训练 pipeline 的 Hydra 配置
-config/eval/                   # eval.py 的 Hydra 配置
-config/consistency/            # consistency distillation 的 Hydra 配置
-diffusion/                     # diffusion planner 模型、训练、policy、pipeline
-planners/                      # teacher dataset / anchors / legacy planner utilities
-scripts/train_diffusion_head.py # 一键构建 dataset + anchors + diffusion planner
-train_diffusion_planner.py      # 只训练 diffusion planner 最后一步
-train_consistency_planner.py    # consistency distillation 入口
-eval.py                        # 环境评估入口
+config/eval/                         # eval.py 的任务配置和 profile
+diffusion/                           # diffusion 模型、训练 loss、runtime policy
+evaluation/                          # trajectory quality 等评估辅助逻辑
+planners/                            # planner dataset 和 action anchor 构建入口
+scripts/run_reacher_diffusion_horizon_pipeline.sh
+                                      # Reacher H=5/10/15/... backbone pipeline
+train_diffusion_planner.py           # diffusion backbone / score-head 训练入口
+eval.py                              # 闭环评估入口
 ```
 
-## 数据处理 Pipeline
+`config/eval/<task>.yaml` 现在同时管理同一个任务的环境配置、dataset 路径和
+planner profiles。运行时用 `eval_profile=...` 选择 profile，避免同一组参数散落在多个
+alias 配置里。
 
-### 输入
+## 1. Diffusion 主线模型
 
-每个任务需要两个核心输入：
-
-1. 原始 HDF5 demonstration 数据。
-2. 已训练好的 LeWM world model checkpoint，即 `task.wm_policy`。
-
-默认路径写在：
+主线 diffusion planner 使用 `K=128` 个 action anchors，先生成 128 个候选
+action chunk，再用 LeWM world-model cost 在候选里选最优动作。这个路径对应 runtime
+selection mode：
 
 ```text
-config/diffusion/task/cube.yaml
-config/diffusion/task/pusht.yaml
-config/diffusion/task/reacher.yaml
-config/diffusion/task/tworoom.yaml
+diffusion_selection_mode=wm_only
+diffusion_num_candidates=128
 ```
 
-例如 TwoRoom：
-
-```yaml
-raw_h5: /data/ykz/tworoom/tworoom.h5
-wm_policy: /data/ykz/tworoom/lewm_epoch_67
-planner_dataset_path: ${pipeline.output_root}/tworoom_planner_dataset.pt
-anchor_bundle_path: ${pipeline.output_root}/tworoom_action_anchors_k${anchors.num_anchors}.pt
-train_output_dir: ${pipeline.output_root}/tworoom_diffusion_k${anchors.num_anchors}_${pipeline.num_samples}
-```
-
-### 输出
-
-pipeline 会生成：
+Reacher 当前主线 bundle 写在 `config/eval/reacher.yaml` 的 `profiles.diffusion`：
 
 ```text
-<task>_planner_dataset.pt
-<task>_action_anchors_k<K>.pt
-<task>_diffusion_k<K>_<N>/diffusion_planner_best_bundle.pt
-<task>_diffusion_k<K>_<N>/diffusion_planner_last_bundle.pt
-<task>_diffusion_k<K>_<N>/diffusion_planner_train_summary.pt
+/data/ykz/reacher/diffusion_pipeline/reacher_diffusion_k128_200000/diffusion_planner_best_bundle.pt
 ```
 
-planner dataset 的核心字段是：
-
-```text
-z_cur         # 当前 latent state
-z_goal        # goal/subgoal latent state
-teacher_plan  # teacher 产生的 action chunk
-meta
-build_info
-```
-
-action anchor bundle 是对 `teacher_plan` 做 K-means 后得到的典型动作块集合。
-
-## 一键训练 Diffusion Planner
-
-推荐入口：
+评估命令：
 
 ```bash
-./.venv/bin/python scripts/train_diffusion_head.py task=tworoom
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+./.venv/bin/python -u eval.py \
+  --config-name reacher \
+  eval_profile=diffusion
 ```
 
-这会按顺序执行：
-
-1. `diffusion.dataset_builder`：从原始 HDF5 + LeWM checkpoint 构建 planner dataset。
-2. `diffusion.anchor_builder`：从 `teacher_plan` 中聚类动作锚点。
-3. `diffusion.train`：训练 anchor-conditioned diffusion planner。
-
-先 dry-run 检查路径和命令：
+小规模 smoke test 可以缩短 episode 数：
 
 ```bash
-./.venv/bin/python scripts/train_diffusion_head.py \
-  task=tworoom \
-  pipeline.device=cpu \
-  pipeline.output_root=/tmp/tworoom_diffusion_dry_run \
-  pipeline.dry_run=true
-```
-
-注意：当前 dry-run 仍会写 `pipeline_summary.yaml`，因此 `pipeline.output_root`
-必须指向可写目录。正式训练时再使用 `/data/ykz/...` 这类长期保存路径。
-
-小规模 smoke run：
-
-```bash
-./.venv/bin/python scripts/train_diffusion_head.py \
-  task=tworoom \
-  pipeline.device=cuda \
-  pipeline.num_samples=1000 \
-  anchors.num_anchors=16 \
-  train.epochs=2 \
-  train.batch_size=16 \
-  train.val_batch_size=32
-```
-
-正式训练示例：
-
-```bash
-./.venv/bin/python scripts/train_diffusion_head.py \
-  task=tworoom \
-  pipeline.device=cuda \
-  pipeline.num_samples=200000 \
-  anchors.num_anchors=128 \
-  train.epochs=80 \
-  train.batch_size=64 \
-  train.val_batch_size=128
-```
-
-覆盖 LeWM checkpoint：
-
-```bash
-./.venv/bin/python scripts/train_diffusion_head.py \
-  task=tworoom \
-  task.wm_policy=/data/ykz/tworoom/lewm_epoch_67
-```
-
-默认 `pipeline.use_raw_dataset=true`，直接从原始 HDF5 构建 planner dataset。如果要恢复旧的 split-first 方式：
-
-```bash
-./.venv/bin/python scripts/train_diffusion_head.py \
-  task=tworoom \
-  pipeline.use_raw_dataset=false
-```
-
-## 评估 Diffusion Planner
-
-`eval.py` 是 Hydra 入口。任务基础配置在：
-
-```text
-config/eval/cube.yaml
-config/eval/pusht.yaml
-config/eval/reacher.yaml
-config/eval/tworoom.yaml
-```
-
-这些任务配置现在收敛为一个文件管理本任务的 eval variants：环境、dataset、
-reset callables、`plan_config` 仍在顶层；planner/checkpoint/bundle 参数放在同文件的
-`profiles` 下面。运行时用 `eval_profile` 选择具体实验：
-
-```text
-eval_profile=mpc                 # LeWM + CEM/MPC baseline
-eval_profile=diffusion           # multi-step diffusion planner
-eval_profile=consistency         # distilled 1-step consistency planner
-eval_profile=corrective_replan   # PushT Phase2 error-triggered replan
-eval_profile=corrective_learned  # PushT Phase3 learned corrector
-```
-
-旧的 `config/eval/<task>_mpc.yaml`、`<task>_diffusion.yaml`、
-`<task>_consistency.yaml` 和 `pusht_diffusion_corrective.yaml` 已归档到
-`config/eval/legacy/`，主目录不再把这些薄 alias 混在任务配置旁边。新实验只改
-`<task>.yaml` 里的 profile，避免同一组参数散落在多个文件。
-
-为了兼容旧脚本，`eval.py` 仍会把旧 config name 自动转换为新 profile：
-
-```text
---config-name cube_mpc                    -> --config-name cube eval_profile=mpc
---config-name cube_diffusion              -> --config-name cube eval_profile=diffusion
---config-name cube_consistency            -> --config-name cube eval_profile=consistency
---config-name pusht_diffusion_corrective  -> --config-name pusht eval_profile=corrective_learned
-```
-
-运行 MPC baseline：
-
-```bash
-./.venv/bin/python eval.py --config-name cube eval_profile=mpc
-```
-
-运行 diffusion planner：
-
-```bash
-./.venv/bin/python eval.py --config-name cube eval_profile=diffusion
-```
-
-论文 `Latent Geometry Beyond Search: Amortizing Planning in World Models` 的
-GC-IDM baseline 走独立 pipeline，不再通过本仓库的 `eval.py` profile 运行。该 pipeline
-调用 `external/latent-geometry-beyond-search/train_idm.py` 和 `eval_idm.py`：
-
-```bash
-scripts/run_lgbs_pipeline.sh --task reacher
-```
-
-可选任务：
-
-```text
---task tworoom
---task pusht
---task cube
---task reacher
---task all
-```
-
-只跑某一个阶段：
-
-```bash
-scripts/run_lgbs_pipeline.sh --task reacher --stage extract
-scripts/run_lgbs_pipeline.sh --task reacher --stage train
-scripts/run_lgbs_pipeline.sh --task reacher --stage eval
-```
-
-复现论文时建议先只跑 CEM，确认 baseline 是否接近论文表格，再看 GC-IDM：
-
-```bash
-scripts/run_lgbs_pipeline.sh --task reacher --stage eval --cem-only
-```
-
-常用完整参数：
-
-```bash
-scripts/run_lgbs_pipeline.sh \
-  --task reacher \
-  --output-root /data/ykz/lgbs_repro \
-  --device cuda:0 \
-  --seed 42 \
-  --epochs 50 \
-  --num-eval 200 \
-  --eval-budget 50 \
-  --goal-offset 25
-```
-
-默认读取本地数据：
-
-```text
-tworoom -> /data/ykz/tworoom/tworoom.h5
-pusht   -> /data/ykz/pusht/pusht_expert_train.h5
-cube    -> /data/ykz/cube/cube_single_expert.h5
-reacher -> /data/ykz/reacher/reacher.h5
-```
-
-输出默认保存在：
-
-```text
-/data/ykz/lgbs_repro/<task>/<task>_embeddings.npz
-/data/ykz/lgbs_repro/<task>/<task>_gcidm.pt
-/data/ykz/lgbs_repro/<task>/logs/extract.log
-/data/ykz/lgbs_repro/<task>/logs/train.log
-/data/ykz/lgbs_repro/<task>/logs/eval.log
-```
-
-PushT 现在默认在 `eval_profile=diffusion`、`corrective_replan` 和
-`corrective_learned` 中打开 refinement；Cube/Reacher/TwoRoom 默认关闭，需要时用
-`diffusion_refinement.enabled=true` 覆盖。
-
-TwoRoom 数据如果放在 `/data/ykz/tworoom/tworoom.h5`，需要显式告诉 `eval.py`
-数据位置。否则 `stable_worldmodel` 默认会去 `/home/ykz/.stable_worldmodel/tworoom.h5`
-找数据，常见报错是 `FileNotFoundError`。
-
-推荐直接指定 HDF5 文件：
-
-```bash
-./.venv/bin/python eval.py \
-  --config-name tworoom \
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+./.venv/bin/python -u eval.py \
+  --config-name reacher \
   eval_profile=diffusion \
-  +dataset_h5=/data/ykz/tworoom/tworoom.h5
+  eval.num_eval=1 \
+  eval.eval_budget=25 \
+  trajectory_quality.enabled=false
 ```
 
-也可以指定 cache 根目录：
-
-```bash
-./.venv/bin/python eval.py \
-  --config-name tworoom \
-  eval_profile=diffusion \
-  cache_dir=/data/ykz/tworoom
-```
-
-`cube.yaml` 的 `profiles.diffusion` 里已经写入了完整 diffusion 配置：
-
-```yaml
-eval_profile: null
-profiles:
-  diffusion:
-    planner_type: diffusion
-    policy: /data/ykz/cube/lewm_epoch_27
-    diffusion_bundle: /data/ykz/cube/diffusion_pipeline/cube_diffusion_k128_200000/diffusion_planner_best_bundle.pt
-    diffusion_selection_mode: wm_only
-    diffusion_num_candidates: 128
-```
-
-临时覆盖评估数量：
-
-```bash
-./.venv/bin/python eval.py --config-name cube eval_profile=diffusion eval.num_eval=10
-```
-
-测试少步推理速度：
-
-```bash
-./.venv/bin/python eval.py \
-  --config-name cube \
-  eval_profile=diffusion \
-  diffusion_truncation_steps=1 \
-  diffusion_selection_mode=wm_only \
-  eval.num_eval=50
-```
-
-正式实验默认使用 `wm_only`，即用 LeWM rollout 给候选动作重排序。模型里的
-score head 只为兼容旧 checkpoint 保留，后续不作为评估或优化路线。
-refinement 已作为 diffusion 配置里的开关接入。除 PushT 当前 profile 默认打开外，
-其他任务默认关闭；需要启用时只覆盖 `diffusion_refinement.enabled=true`：
-
-```bash
-./.venv/bin/python eval.py \
-  --config-name cube \
-  eval_profile=diffusion \
-  diffusion_refinement.enabled=true
-```
-
-默认 refinement 参数写在每个任务配置的 `diffusion_refinement` 和
-`profiles.<profile>.diffusion_refinement`：
-
-```yaml
-diffusion_refinement:
-  enabled: false
-  steps: 1
-  step_size: 0.03
-  topk: 16
-  goal_weight: 1.0
-  prior_weight: 0.05
-  smoothness_weight: 0.005
-  grad_clip_norm: 1.0
-```
-
-这里的 `topk` 是按 LeWM cost 选最低成本候选，不使用 score head。
-旧的 `--task tworoom` 用法会默认映射到
-`--config-name tworoom eval_profile=mpc`。
-
-评估日志关注：
+评估时间统一看这些字段：
 
 ```text
-[summary] success_rate=...
+[summary] evaluation_time=...
+[planner-stats] global_planning_calls=...
+[planner-stats] planning_time_total_sec=...
 [planner-stats] avg_planning_time_sec=...
-[planner-stats] avg_generation_time_sec=...
-[planner-stats] avg_scoring_time_sec=...
+[worldmodel-stats] wm_rollout_candidate_count=...
 ```
 
-Hydra 默认会把运行目录放到：
+其中 `evaluation_time` 是整个 `world.evaluate_from_dataset(...)` 的 wall-clock 时间；
+不同 planner 的规划速度比较优先看 `planning_time_total_sec` 和
+`avg_planning_time_sec`。如果涉及 `wm_only` 或 `score_topk_wm`，还要同时看
+`wm_rollout_candidate_count`，确认实际计算了多少个 world-model candidate。
+
+## 2. H=10 Top16-WMCost Score Head
+
+`top16-wmcost` 的目标不是完全替代 world-model cost，而是把 128 个 diffusion 候选先
+用 score head 预筛成 16 个，再只在这 16 个里面计算 wm-cost：
 
 ```text
-outputs/YYYY-MM-DD/HH-MM-SS/
+generate 128 candidates
+  -> score_head rank
+  -> keep score top16
+  -> compute wm-cost for top16 only
+  -> select the minimum wm-cost candidate inside top16
 ```
 
-### Closed-loop Corrective Phase2
-
-Phase2 是 training-free 的 error-triggered replanning baseline：diffusion planner
-先生成 action chunk；执行中每到 LeWM latent rollout 的 checkpoint，就比较真实 latent
-和预测 latent。如果 `prediction_error > corrective.error_threshold`，丢弃当前 chunk
-剩余动作，并用当前观测重新调用 diffusion planner。
-
-由于当前 LeWM rollout 按 `plan_config.action_block` 计算，PushT/TwoRoom/Cube 默认
-`action_block=5`。因此 `corrective.correction_interval=2` 会实际延后到第 5、10、15...
-步检查。建议 Phase2 先显式设成 `5`。
-
-并行 eval 时必须避免 batch-global replan：某个 episode/env drift 了，只应该替换该
-env 后续动作，不应该让其他 env 一起丢弃 chunk。因此 Phase2 默认使用
-`trigger_scope=per_env`。`trigger_scope=batch` 只用于复现旧的全局触发行为；如果使用
-batch 模式，再考虑 `trigger_stat=quantile trigger_quantile=0.9`。
-
-PushT 推荐从阈值 sweep 开始：
-
-```bash
-./.venv/bin/python eval.py \
-  --config-name pusht \
-  eval_profile=corrective_replan \
-  +dataset_h5=/data/ykz/pusht/pusht_expert_train.h5 \
-  corrective.error_threshold=3.0
-```
-
-建议对 PushT 依次跑：
+对应 runtime profile 是 `diffusion_h10_score_top16_wm`：
 
 ```text
-corrective.error_threshold=2.5
-corrective.error_threshold=3.0
-corrective.error_threshold=3.5
-corrective.error_threshold=4.0
-corrective.error_threshold=5.0
+diffusion_bundle=/data/ykz/reacher/diffusion_pipeline/reacher_h10_score_head_mlp_top16_margin/diffusion_planner_best_bundle.pt
+diffusion_selection_mode=score_topk_wm
+diffusion_score_topk=16
+diffusion_num_candidates=128
+diffusion_runtime_execute_steps=10
+plan_config.receding_horizon=2
+plan_config.action_block=5
 ```
 
-TwoRoom 也可以用同样方式跑，但 Phase1 当前全成功，阈值只能先看触发频率：
+评估命令：
 
 ```bash
-./.venv/bin/python eval.py \
-  --config-name tworoom \
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+./.venv/bin/python -u eval.py \
+  --config-name reacher \
+  eval_profile=diffusion_h10_score_top16_wm
+```
+
+smoke test：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+./.venv/bin/python -u eval.py \
+  --config-name reacher \
+  eval_profile=diffusion_h10_score_top16_wm \
+  eval.num_eval=1 \
+  eval.eval_budget=25 \
+  trajectory_quality.enabled=false
+```
+
+日志里应该能看到：
+
+```text
+selection_mode=score_topk_wm score_topk=16
+[diffusion-rerank] finite_candidate_rate=0.1250
+[worldmodel-stats] wm_rollout_candidate_count=<global_planning_calls * 16>
+```
+
+这三项一起确认 runtime 的确只对 top16 计算 wm-cost。
+
+### Score Head 训练
+
+当前 score head 使用 MLP：
+
+```text
+LayerNorm(hidden_dim)
+  -> Linear(hidden_dim, score_head_hidden_dim)
+  -> activation
+  -> ... repeated score_head_num_layers times
+  -> Linear(score_head_hidden_dim, 1)
+```
+
+训练时冻结 diffusion backbone，只训练 `score_head.*`。loss 用
+`wm_score_topk_margin` preset：
+
+```text
+rec / BCE / anchor score loss: disabled
+wm-score target: minimum wm-cost candidate as top-1 CE label
+top-k margin: push the minimum wm-cost candidate above the top16 boundary
+candidate source: inference candidates, matching eval-time denoising candidates
+```
+
+Reacher H=10 score-head 训练命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+./.venv/bin/python -u train_diffusion_planner.py \
+  --dataset-path /data/ykz/reacher/diffusion_pipeline/single_peak_reacher_traj_h10_200k_raw.pt \
+  --anchor-bundle-path /data/ykz/reacher/diffusion_pipeline/reacher_action_anchors_h10_200k_k128_raw.pt \
+  --init-bundle-path /data/ykz/reacher/diffusion_pipeline/reacher_h10_diffusion_200k_simple_bce_k128_raw/diffusion_planner_best_bundle.pt \
+  --wm-policy /data/ykz/reacher/lewm_epoch_29 \
+  --output-dir /data/ykz/reacher/diffusion_pipeline/reacher_h10_score_head_mlp_top16_margin \
+  --device cuda \
+  --epochs 80 \
+  --batch-size 64 \
+  --val-batch-size 128 \
+  --num-workers 4 \
+  --loss-preset wm_score_topk_margin \
+  --score-head-type mlp \
+  --score-head-hidden-dim 256 \
+  --score-head-num-layers 2 \
+  --freeze-non-score-head \
+  --wm-score-topk-margin-k 16 \
+  --wm-score-topk-margin 0.1 \
+  --wm-score-topk-margin-weight 0.5 \
+  --log-every 50
+```
+
+训练时主要看：
+
+```text
+train_wm_score_acc / val_wm_score_acc
+train_wm_score_topk_acc / val_wm_score_topk_acc
+train_wm_score_ranking_loss / val_wm_score_ranking_loss
+```
+
+`top16-wmcost` 需要的是 `wm_score_topk_acc` 稳定较高；`wm_score_acc` 直接对应 top1，
+通常更难提升。
+
+## 3. Action Horizon H 探索
+
+H 表示 diffusion action chunk 覆盖的环境 step 数。Reacher 当前约定固定：
+
+```text
+action_block=5
+receding_horizon=H / action_block
+```
+
+所以 `H` 必须是 5 的倍数。我们用同一个脚本控制 H，其他参数保持主线版本：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+scripts/run_reacher_diffusion_horizon_pipeline.sh \
+  --horizon 5 \
+  --output-root /data/ykz/reacher/diffusion_pipeline \
+  --device cuda
+
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+scripts/run_reacher_diffusion_horizon_pipeline.sh \
+  --horizon 10 \
+  --output-root /data/ykz/reacher/diffusion_pipeline \
+  --device cuda
+
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+scripts/run_reacher_diffusion_horizon_pipeline.sh \
+  --horizon 15 \
+  --output-root /data/ykz/reacher/diffusion_pipeline \
+  --device cuda
+```
+
+这个 pipeline 只训练 diffusion backbone，不微调 score head。它会依次执行：
+
+```text
+planners/build_single_peak_dataset.py
+planners/build_action_anchors.py
+train_diffusion_planner.py --loss-preset simple_bce
+```
+
+默认输出路径模板：
+
+```text
+/data/ykz/reacher/diffusion_pipeline/single_peak_reacher_traj_h<H>_200k_raw.pt
+/data/ykz/reacher/diffusion_pipeline/reacher_action_anchors_h<H>_200k_k128_raw.pt
+/data/ykz/reacher/diffusion_pipeline/reacher_h<H>_diffusion_200k_simple_bce_k128_raw/diffusion_planner_best_bundle.pt
+/data/ykz/reacher/diffusion_pipeline/reacher_h<H>_diffusion_200k_simple_bce_k128_raw/pipeline_logs/
+/data/ykz/reacher/diffusion_pipeline/reacher_h<H>_diffusion_200k_simple_bce_k128_raw/pipeline_summary.txt
+```
+
+H=10 已有 profile：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+./.venv/bin/python -u eval.py \
+  --config-name reacher \
+  eval_profile=diffusion_h10_wm_only
+```
+
+如果临时评估 H=5 或 H=15，而还没有写入固定 profile，可以在 `diffusion` profile 上覆盖
+bundle 和 runtime H：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib-cache \
+./.venv/bin/python -u eval.py \
+  --config-name reacher \
   eval_profile=diffusion \
-  +dataset_h5=/data/ykz/tworoom/tworoom.h5 \
-  corrective.enabled=true \
-  corrective.mode=replan \
-  corrective.logging.log_prediction_error=true \
-  corrective.correction_interval=5 \
-  corrective.execute_horizon=25 \
-  corrective.trigger_scope=per_env \
-  corrective.error_threshold=1.5
+  profiles.diffusion.diffusion_bundle=/data/ykz/reacher/diffusion_pipeline/reacher_h15_diffusion_200k_simple_bce_k128_raw/diffusion_planner_best_bundle.pt \
+  plan_config.receding_horizon=3 \
+  plan_config.action_block=5 \
+  diffusion_runtime_execute_steps=15
 ```
 
-Phase2 结果会在终端和结果文件里输出：
+H=5 时把 bundle 改成 `reacher_h5_...`，并设置：
 
 ```text
-corrective_check_count
-corrective_replan_count
-corrective_replan_rate
-mean_prediction_error_before_replan
-max_prediction_error_before_replan
-prediction_error_summary
+plan_config.receding_horizon=1
+diffusion_runtime_execute_steps=5
 ```
 
-### Closed-loop Corrective Phase3
+## 4. 系统测试建议
 
-Phase3 是 learned corrector：不再在触发时重新调用 diffusion planner，而是用一个小
-MLP 修正当前 chunk 中还没执行的动作。第一版 corrector 使用现有 planner dataset
-构造 synthetic drift：给 expert prefix 和 remainder 加噪声，用 frozen LeWM rollout
-得到 latent error，再监督 corrector 输出 clean expert remainder。
-
-训练 PushT corrector：
-
-```bash
-./.venv/bin/python train_corrective_diffusion.py \
-  task=pusht \
-  corrective.correction_interval=5 \
-  training.noise_std=0.05 \
-  training.lambda_goal=0.0 \
-  train.epochs=20
-```
-
-输出默认在：
+后续系统测试优先固定同一张 GPU、同一个 `eval.num_eval` 和同一个
+`eval.eval_budget`，比较下面三组：
 
 ```text
-/data/ykz/pusht/diffusion_pipeline/pusht_corrector_ci5/
+1. eval_profile=diffusion
+   25-action diffusion + 128-candidate wm_only
+
+2. eval_profile=diffusion_h10_wm_only
+   10-action diffusion + 128-candidate wm_only
+
+3. eval_profile=diffusion_h10_score_top16_wm
+   10-action diffusion + score top16 prefilter + wm-cost
 ```
 
-评估 learned corrector：
-
-```bash
-./.venv/bin/python eval.py \
-  --config-name pusht \
-  eval_profile=corrective_learned \
-  +dataset_h5=/data/ykz/pusht/pusht_expert_train.h5
-```
-
-`pusht.yaml` 的 `profiles.corrective_learned` 已经收进了 Phase3 默认参数：
+每次记录：
 
 ```text
-corrective.enabled=true
-corrective.mode=learned
-corrective.corrector_path=/data/ykz/pusht/diffusion_pipeline/pusht_corrector_ci5/corrector_best_bundle.pt
-corrective.correction_interval=5
-corrective.execute_horizon=25
-corrective.trigger_scope=per_env
-corrective.error_threshold=5.0
-corrective.logging.log_prediction_error=true
+success_rate
+evaluation_time
+planning_time_total_sec
+avg_planning_time_sec
+global_planning_calls
+wm_rollout_candidate_count
+wm_rollout_time_total_sec
 ```
 
-这个 profile 的作用是把原来很长的 `corrective.*` eval override 收到一个任务文件里，
-避免每次手动输入一整串参数。基础 diffusion eval 使用
-`--config-name pusht eval_profile=diffusion`；Phase3 learned corrector eval 使用
-`--config-name pusht eval_profile=corrective_learned`。
+速度比较以 `planning_time_total_sec` / `avg_planning_time_sec` 为主；
+`evaluation_time` 会包含环境 reset、渲染、dataset replay 等闭环开销，只作为整体 wall-clock
+参考。
 
-如果要换阈值或 corrector，只 override 需要改的项：
+## 5. 基本验证
 
-```bash
-./.venv/bin/python eval.py \
-  --config-name pusht \
-  eval_profile=corrective_learned \
-  +dataset_h5=/data/ykz/pusht/pusht_expert_train.h5 \
-  corrective.error_threshold=4.5 \
-  corrective.corrector_path=/path/to/corrector_best_bundle.pt
-```
-
-Phase3 结果额外输出：
-
-```text
-corrective_correction_count
-mean_correction_norm
-mean_action_delta_norm
-correction_time_total_sec
-avg_correction_time_sec
-```
-
-当前 corrector 是固定 remainder horizon 版本。以 PushT 的 `execute_horizon=25` 和
-`correction_interval=5` 为例，它训练的是 20 步 remainder，所以最适合在第一个
-checkpoint 修一次；后续要支持第 10/15/20 步继续修，需要扩展成 variable-horizon
-或多 corrector 版本。
-
-`corrective.mode=learned` 会在 eval 初始化时检查 corrector 的 `remain_horizon` 是否
-等于 `corrective.execute_horizon - effective_correction_interval`。如果训练 corrector
-和 eval 使用的 `correction_interval/action_block/execute_horizon` 不匹配，会直接报错，
-而不是静默跳过 correction。
-
-可以先只检查 Hydra 配置是否正确组合：
-
-```bash
-./.venv/bin/python eval.py \
-  --config-name pusht \
-  eval_profile=corrective_learned \
-  +dataset_h5=/data/ykz/pusht/pusht_expert_train.h5 \
-  --cfg job
-```
-
-## Consistency Distillation
-
-目标是把多步 diffusion planner 蒸馏成 1-2 step consistency planner，降低推理延迟。
-入口：
-
-```bash
-./.venv/bin/python train_consistency_planner.py task=cube
-```
-
-配置在：
-
-```text
-config/consistency/train.yaml
-config/consistency/task/cube.yaml
-config/consistency/task/pusht.yaml
-config/consistency/task/reacher.yaml
-config/consistency/task/tworoom.yaml
-```
-
-常用命令：
-
-```bash
-./.venv/bin/python train_consistency_planner.py \
-  task=cube \
-  runtime.device=cuda \
-  teacher.bundle_path=/path/to/diffusion_planner_best_bundle.pt \
-  task.planner_dataset_path=/path/to/planner_dataset.pt \
-  output.dir=/path/to/consistency_train \
-  train.epochs=50 \
-  distill.teacher_ode_steps=2
-```
-
-训练流程：
-
-1. 先用 `scripts/train_diffusion_head.py` 训练完整 teacher diffusion planner，并保存 `diffusion_planner_best_bundle.pt`。
-2. 用同一个 planner dataset 和 teacher bundle 启动 `train_consistency_planner.py`。
-3. 训练时 student 默认从 teacher planner warm-start，但会保持可训练；frozen teacher 负责产生短 ODE bridge target，EMA student 负责 consistency target。
-4. 默认损失包含 consistency matching 和 action L1 监督；`distill.goal_loss_weight>0` 时额外启用 LeWM latent goal consistency。
-5. 训练完成后把 `consistency_planner_best_bundle.pt` 交给 `eval.py --config-name <task> eval_profile=consistency` 做 1-step 闭环评估。
-
-启用 LeWM latent goal consistency：
-
-```bash
-./.venv/bin/python train_consistency_planner.py \
-  task=cube \
-  teacher.bundle_path=/path/to/diffusion_planner_best_bundle.pt \
-  task.planner_dataset_path=/path/to/planner_dataset.pt \
-  task.wm_policy=/data/ykz/cube/lewm_epoch_27 \
-  distill.goal_loss_weight=0.1
-```
-
-输出：
-
-```text
-consistency_planner_best_bundle.pt
-consistency_planner_last_bundle.pt
-consistency_planner_ema_bundle.pt
-consistency_planner_train_summary.pt
-```
-
-评估 consistency planner：
-
-```bash
-./.venv/bin/python eval.py --config-name cube eval_profile=consistency
-```
-
-每个任务配置的 `profiles.consistency` 默认使用 `diffusion_truncation_steps=1` 和
-`diffusion_selection_mode=wm_only`。score head 只为 checkpoint 兼容保留，后续
-consistency 实验也不再使用 `score_only` 或 `hybrid` 路线。
-
-## 常用测试
-
-代码级回归测试：
+配置和 top16 runtime 相关单测：
 
 ```bash
 ./.venv/bin/python -m pytest \
-  tests/test_diffusion_pipeline.py \
-  tests/test_diffusion_policy_refinement.py \
-  tests/test_diffusion_policy_prediction_error.py \
-  tests/test_prediction_error.py \
+  tests/test_eval_planner_configs.py::EvalPlannerConfigTests::test_reacher_h10_eval_profiles_resolve_runtime_overrides \
+  tests/test_diffusion_policy_refinement.py::DiffusionPolicyRefinementTest::test_score_topk_wm_scores_only_score_prefiltered_candidates \
   -q
 ```
 
-Consistency 相关测试：
+全量测试：
 
 ```bash
-./.venv/bin/python -m pytest tests/test_consistency_distillation.py -q
-```
-
-检查 Hydra 原始配置能否解析：
-
-```bash
-./.venv/bin/python eval.py --config-name cube eval_profile=diffusion --cfg job
-./.venv/bin/python eval.py --config-name cube eval_profile=diffusion diffusion_refinement.enabled=true --cfg job
-./.venv/bin/python eval.py --config-name cube eval_profile=mpc --cfg job
-```
-
-注意：`--cfg job` 是 Hydra 在进入 `run()` 之前打印的原始配置，会显示
-`eval_profile` 和 `profiles`，但不会显示 `eval.py` 运行时展开后的最终 planner 字段。
-真正 eval 时 `resolve_eval_profile_config()` 会把选中的 profile 合并到顶层。
-
-检查 diffusion pipeline 配置能否解析：
-
-```bash
-./.venv/bin/python scripts/train_diffusion_head.py \
-  task=tworoom \
-  pipeline.device=cpu \
-  pipeline.output_root=/tmp/tworoom_diffusion_dry_run \
-  pipeline.dry_run=true
-```
-
-## 已做的优化
-
-- 用 Hydra 配置统一 diffusion pipeline、eval 和 consistency distillation。
-- 默认从 raw HDF5 直接构建 planner dataset，避免必须先 split 数据。
-- 将 teacher planner 数据构建、action anchors、diffusion planner 训练拆成明确阶段。
-- 引入 action anchors，让 diffusion planner 从典型动作块附近生成候选动作。
-- `DiffusionPlannerPolicy` 支持候选动作生成后用 LeWM rollout rerank。
-- 支持 `diffusion_truncation_steps` 控制推理去噪步数，便于做速度/成功率 trade-off。
-- 正式评估路线固定为 `diffusion_selection_mode=wm_only`；score head 仅保留 checkpoint 兼容。
-- 增加 optional world-model refinement 和 prediction-error logging；refinement top-k 使用 LeWM cost 预筛。
-- 增加 consistency distillation 独立模块和 Hydra 配置，目标是 1-2 step planner。
-
-## 原始项目
-
-本项目基于 LeWorldModel：
-
-```bibtex
-@article{maes_lelidec2026lewm,
-  title={LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels},
-  author={Maes, Lucas and Le Lidec, Quentin and Scieur, Damien and LeCun, Yann and Balestriero, Randall},
-  journal={arXiv preprint},
-  year={2026}
-}
+./.venv/bin/python -m pytest -q
 ```

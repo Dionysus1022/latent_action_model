@@ -20,6 +20,7 @@ from diffusion.model import (
     DiffusionPlannerModelConfig,
     infer_model_config_from_dataset_and_anchor_bundle,
     load_diffusion_planner_bundle,
+    _normalize_model_hyperparameters,
     save_diffusion_planner_bundle,
 )
 from diffusion.utils import denoise_step_from_x0
@@ -164,15 +165,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-layers", type=int, default=3, help="Condition trunk depth.")
     parser.add_argument("--fusion-num-layers", type=int, default=2, help="Fusion trunk depth.")
     parser.add_argument(
-        "--denoiser-type",
-        choices=["mlp", "dit"],
-        default="mlp",
-        help="Denoiser backend. `mlp` preserves the original flattened action MLP; `dit` uses action-token self-attention with latent cross-attention.",
-    )
-    parser.add_argument("--dit-num-layers", type=int, default=4, help="Number of DiT action-token blocks.")
-    parser.add_argument("--dit-num-heads", type=int, default=4, help="Number of DiT attention heads.")
-    parser.add_argument("--dit-mlp-ratio", type=float, default=4.0, help="DiT block feed-forward expansion ratio.")
-    parser.add_argument(
         "--score-head-type",
         choices=["linear", "mlp"],
         default="linear",
@@ -275,7 +267,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--goal-loss-weight",
         type=float,
         default=0.0,
-        help="Optional latent-only rollout goal-consistency loss weight.",
+        help="Optional latent-only rollout goal-alignment loss weight.",
     )
     parser.add_argument(
         "--goal-loss-history-size",
@@ -346,7 +338,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--score-ranking-weight",
         type=float,
         default=0.1,
-        help="Weight for the soft anchor-distance ranking consistency loss on score logits.",
+        help="Weight for the soft anchor-distance ranking-agreement loss on score logits.",
     )
     parser.add_argument(
         "--score-ranking-temperature",
@@ -634,10 +626,6 @@ def build_model_from_dataset_and_anchor_bundle(
         activation=args.activation,
         timestep_embedding_dim=args.timestep_embedding_dim,
         fusion_num_layers=args.fusion_num_layers,
-        denoiser_type=args.denoiser_type,
-        dit_num_layers=args.dit_num_layers,
-        dit_num_heads=args.dit_num_heads,
-        dit_mlp_ratio=args.dit_mlp_ratio,
         num_train_steps=args.num_train_steps,
         truncation_steps=args.truncation_steps,
         start_timestep=args.start_timestep,
@@ -659,7 +647,7 @@ def initialize_model_from_bundle(
 ) -> None:
     """Initialize a freshly built compatible model from a saved planner bundle."""
     bundle = load_diffusion_planner_bundle(bundle_path, map_location="cpu")
-    bundle_cfg = bundle.model_hyperparameters
+    bundle_cfg = _normalize_model_hyperparameters(bundle.model_hyperparameters)
     current_cfg = model.config
 
     def get_config_value(config: Any, field_name: str) -> Any:
@@ -685,10 +673,6 @@ def initialize_model_from_bundle(
         "beta_end",
         "timestep_embedding_dim",
         "activation",
-        "denoiser_type",
-        "dit_num_layers",
-        "dit_num_heads",
-        "dit_mlp_ratio",
     )
     strict_score_head_fields = (
         "score_head_type",
@@ -2157,17 +2141,6 @@ def main(argv: list[str] | None = None) -> None:
             "wm_score_topk_margin_weight must be non-negative, "
             f"got {args.wm_score_topk_margin_weight}."
         )
-    if args.dit_num_layers <= 0:
-        raise ValueError(f"dit_num_layers must be positive, got {args.dit_num_layers}.")
-    if args.dit_num_heads <= 0:
-        raise ValueError(f"dit_num_heads must be positive, got {args.dit_num_heads}.")
-    if args.hidden_dim % args.dit_num_heads != 0:
-        raise ValueError(
-            "hidden_dim must be divisible by dit_num_heads, "
-            f"got hidden_dim={args.hidden_dim}, dit_num_heads={args.dit_num_heads}."
-        )
-    if args.dit_mlp_ratio <= 0.0:
-        raise ValueError(f"dit_mlp_ratio must be positive, got {args.dit_mlp_ratio}.")
     if args.score_head_hidden_dim is not None and args.score_head_hidden_dim <= 0:
         raise ValueError(
             "score_head_hidden_dim must be positive when provided, "
@@ -2276,9 +2249,6 @@ def main(argv: list[str] | None = None) -> None:
         f"action_chunk_horizon={model.action_chunk_horizon} "
         f"action_chunk_dim={model.action_chunk_dim} plan_horizon={model.plan_horizon} "
         f"action_dim={model.action_dim} num_anchors={model.num_anchors} "
-        f"denoiser_type={model.config.denoiser_type} "
-        f"dit_num_layers={model.config.dit_num_layers} "
-        f"dit_num_heads={model.config.dit_num_heads} "
         f"score_head_type={model.config.score_head_type} "
         f"score_head_hidden_dim={model.config.score_head_hidden_dim} "
         f"score_head_num_layers={model.config.score_head_num_layers} "

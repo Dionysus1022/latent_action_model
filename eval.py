@@ -21,7 +21,7 @@ import stable_worldmodel as swm
 from diffusion.policy import DiffusionPlannerPolicy
 from planners.multi_candidate_policy import MultiCandidatePolicy
 from planners.single_peak_policy import SinglePeakPolicy
-from trajectory_quality import (
+from evaluation.trajectory_quality import (
     compute_latent_monotonicity,
     compute_task_goal_distances,
     compute_trajectory_quality,
@@ -40,8 +40,6 @@ TASK_ALIASES = {
 LEGACY_EVAL_CONFIG_ALIASES = {
     **{f"{task}_mpc": (task, "mpc") for task in ["cube", "pusht", "reacher", "tworoom"]},
     **{f"{task}_diffusion": (task, "diffusion") for task in ["cube", "pusht", "reacher", "tworoom"]},
-    **{f"{task}_consistency": (task, "consistency") for task in ["cube", "pusht", "reacher", "tworoom"]},
-    "pusht_diffusion_corrective": ("pusht", "corrective_learned"),
 }
 
 PROFILE_SECTION_DEFAULTS = {
@@ -54,29 +52,6 @@ PROFILE_SECTION_DEFAULTS = {
         "prior_weight": None,
         "smoothness_weight": None,
         "grad_clip_norm": None,
-    },
-    "diffusion_rerank_penalty": {
-        "delta_weight": None,
-        "jerk_weight": None,
-        "action_l2_weight": None,
-        "clip_weight": None,
-    },
-    "corrective": {
-        "enabled": None,
-        "mode": None,
-        "corrector_path": None,
-        "correction_interval": None,
-        "execute_horizon": None,
-        "error_threshold": None,
-        "trigger_stat": None,
-        "trigger_quantile": None,
-        "trigger_scope": None,
-        "error_metric": None,
-        "logging": {
-            "log_prediction_error": None,
-            "log_correction_norm": None,
-            "log_replan_count": None,
-        },
     },
 }
 
@@ -736,85 +711,6 @@ def run_evaluation_with_trajectory_quality(
     return results, quality
 
 
-def resolve_corrective_config(cfg: DictConfig) -> dict:
-    corrective_cfg = cfg.get("corrective", None)
-    if corrective_cfg is None:
-        return {
-            "enabled": False,
-            "mode": "none",
-            "corrector_path": None,
-            "correction_interval": 2,
-            "execute_horizon": None,
-            "error_threshold": 0.5,
-            "trigger_stat": "max",
-            "trigger_quantile": 0.9,
-            "trigger_scope": "per_env",
-            "error_metric": "l2",
-            "logging": {
-                "log_prediction_error": False,
-            },
-        }
-    container = OmegaConf.to_container(corrective_cfg, resolve=True)
-    if not isinstance(container, dict):
-        raise TypeError(
-            "cfg.corrective must resolve to a dictionary, "
-            f"got {type(container).__name__}."
-        )
-    logging_cfg = container.get("logging") or {}
-    if not isinstance(logging_cfg, dict):
-        raise TypeError("cfg.corrective.logging must resolve to a dictionary.")
-
-    enabled = bool(value_or_default(container.get("enabled", None), False))
-    mode = str(value_or_default(container.get("mode", None), "none")).lower().strip()
-    if mode not in {"none", "replan", "learned"}:
-        raise ValueError(
-            f"Unsupported corrective.mode '{mode}'. Expected none, replan, or learned."
-        )
-    trigger_stat = str(value_or_default(container.get("trigger_stat", None), "max")).lower().strip()
-    if trigger_stat not in {"max", "mean", "quantile"}:
-        raise ValueError(
-            "Unsupported corrective.trigger_stat "
-            f"'{trigger_stat}'. Expected max, mean, or quantile."
-        )
-    trigger_quantile = float(value_or_default(container.get("trigger_quantile", None), 0.9))
-    if trigger_quantile < 0.0 or trigger_quantile > 1.0:
-        raise ValueError(
-            "corrective.trigger_quantile must be in [0, 1], "
-            f"got {trigger_quantile}."
-        )
-    trigger_scope = str(value_or_default(container.get("trigger_scope", None), "per_env")).lower().strip()
-    if trigger_scope not in {"per_env", "batch"}:
-        raise ValueError(
-            "Unsupported corrective.trigger_scope "
-            f"'{trigger_scope}'. Expected per_env or batch."
-        )
-    corrector_path = value_or_default(container.get("corrector_path", None), None)
-    if enabled and mode == "learned":
-        if corrector_path in [None, "", "null"]:
-            raise ValueError(
-                "corrective.corrector_path must be set when corrective.enabled=true "
-                "and corrective.mode=learned."
-            )
-
-    return {
-        "enabled": enabled,
-        "mode": mode,
-        "corrector_path": corrector_path,
-        "correction_interval": int(value_or_default(container.get("correction_interval", None), 2)),
-        "execute_horizon": value_or_default(container.get("execute_horizon", None), None),
-        "error_threshold": float(value_or_default(container.get("error_threshold", None), 0.5)),
-        "trigger_stat": trigger_stat,
-        "trigger_quantile": trigger_quantile,
-        "trigger_scope": trigger_scope,
-        "error_metric": str(value_or_default(container.get("error_metric", None), "l2")).lower().strip(),
-        "logging": {
-            "log_prediction_error": bool(
-                value_or_default(logging_cfg.get("log_prediction_error", None), False)
-            ),
-        },
-    }
-
-
 def resolve_diffusion_refinement_config(cfg: DictConfig) -> dict:
     refinement_cfg = cfg.get("diffusion_refinement", None)
     if refinement_cfg is None:
@@ -861,45 +757,10 @@ def resolve_diffusion_refinement_config(cfg: DictConfig) -> dict:
     }
 
 
-def resolve_diffusion_rerank_penalty_config(cfg: DictConfig) -> dict:
-    penalty_cfg = cfg.get("diffusion_rerank_penalty", None)
-    if penalty_cfg is None:
-        return {
-            "delta_weight": 0.0,
-            "jerk_weight": 0.0,
-            "action_l2_weight": 0.0,
-            "clip_weight": 0.0,
-        }
-    container = OmegaConf.to_container(penalty_cfg, resolve=True)
-    if not isinstance(container, dict):
-        raise TypeError(
-            "cfg.diffusion_rerank_penalty must resolve to a dictionary, "
-            f"got {type(container).__name__}."
-        )
-    return {
-        "delta_weight": float(value_or_default(container.get("delta_weight", None), 0.0)),
-        "jerk_weight": float(value_or_default(container.get("jerk_weight", None), 0.0)),
-        "action_l2_weight": float(value_or_default(container.get("action_l2_weight", None), 0.0)),
-        "clip_weight": float(value_or_default(container.get("clip_weight", None), 0.0)),
-    }
-
-
-def resolve_diffusion_runtime_execute_steps(
-    diffusion_runtime_execute_steps,
-    corrective_cfg: dict,
-) -> int | None:
+def resolve_diffusion_runtime_execute_steps(diffusion_runtime_execute_steps) -> int | None:
     if diffusion_runtime_execute_steps in [None, "", "null"]:
-        resolved = None
-    else:
-        resolved = int(diffusion_runtime_execute_steps)
-
-    if not bool(corrective_cfg.get("enabled", False)):
-        return resolved
-
-    corrective_execute_horizon = corrective_cfg.get("execute_horizon", None)
-    if corrective_execute_horizon not in [None, "", "null"]:
-        resolved = int(corrective_execute_horizon)
-    return resolved
+        return None
+    return int(diffusion_runtime_execute_steps)
 
 
 def summarize_solver_config(solver_cfg: DictConfig) -> tuple[str, dict]:
@@ -1001,7 +862,7 @@ def run(cfg: DictConfig):
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
+    stats_dataset = dataset
     available_columns = list(dataset.column_names)
     episode_key = infer_dataset_column(
         available_columns=available_columns,
@@ -1041,9 +902,7 @@ def run(cfg: DictConfig):
     diffusion_noise_scale = float(cfg.get("diffusion_noise_scale", 1.0))
     diffusion_sampling_temperature = float(cfg.get("diffusion_sampling_temperature", 1.0))
     diffusion_runtime_execute_steps = cfg.get("diffusion_runtime_execute_steps", None)
-    corrective_cfg = resolve_corrective_config(cfg)
     refinement_cfg = resolve_diffusion_refinement_config(cfg)
-    rerank_penalty_cfg = resolve_diffusion_rerank_penalty_config(cfg)
     trajectory_quality_cfg = resolve_trajectory_quality_config(cfg)
     eval_callables = resolve_eval_callables(cfg)
     if len(eval_callables) == 0:
@@ -1073,10 +932,7 @@ def run(cfg: DictConfig):
     else:
         diffusion_start_timestep = int(diffusion_start_timestep)
 
-    diffusion_runtime_execute_steps = resolve_diffusion_runtime_execute_steps(
-        diffusion_runtime_execute_steps,
-        corrective_cfg,
-    )
+    diffusion_runtime_execute_steps = resolve_diffusion_runtime_execute_steps(diffusion_runtime_execute_steps)
 
     if planner_type == "mpc":
         if policy_name != "random":
@@ -1191,17 +1047,6 @@ def run(cfg: DictConfig):
             goal_offset_steps=int(cfg.eval.goal_offset_steps),
             eval_budget=int(cfg.eval.eval_budget),
             runtime_execute_steps=diffusion_runtime_execute_steps,
-            corrective_enabled=bool(corrective_cfg["enabled"]),
-            corrective_mode=str(corrective_cfg["mode"]),
-            corrective_correction_interval=int(corrective_cfg["correction_interval"]),
-            corrective_error_threshold=float(corrective_cfg["error_threshold"]),
-            corrective_trigger_stat=str(corrective_cfg["trigger_stat"]),
-            corrective_trigger_quantile=float(corrective_cfg["trigger_quantile"]),
-            corrective_trigger_scope=str(corrective_cfg["trigger_scope"]),
-            corrective_error_metric=str(corrective_cfg["error_metric"]),
-            corrective_log_prediction_error=bool(corrective_cfg["enabled"])
-            and bool(corrective_cfg["logging"]["log_prediction_error"]),
-            corrector_path=corrective_cfg["corrector_path"],
             refinement_enabled=bool(refinement_cfg["enabled"]),
             refinement_steps=int(refinement_cfg["steps"]),
             refinement_step_size=float(refinement_cfg["step_size"]),
@@ -1210,10 +1055,6 @@ def run(cfg: DictConfig):
             refinement_prior_weight=float(refinement_cfg["prior_weight"]),
             refinement_smoothness_weight=float(refinement_cfg["smoothness_weight"]),
             refinement_grad_clip_norm=refinement_cfg["grad_clip_norm"],
-            rerank_delta_weight=float(rerank_penalty_cfg["delta_weight"]),
-            rerank_jerk_weight=float(rerank_penalty_cfg["jerk_weight"]),
-            rerank_action_l2_weight=float(rerank_penalty_cfg["action_l2_weight"]),
-            rerank_clip_weight=float(rerank_penalty_cfg["clip_weight"]),
         )
         print(
             "[planner] "
@@ -1241,11 +1082,7 @@ def run(cfg: DictConfig):
             f"refinement_enabled={int(policy.refinement_enabled)} "
             f"refinement_steps={policy.refinement_steps} "
             f"refinement_step_size={policy.refinement_step_size:.6f} "
-            f"refinement_topk={policy.refinement_topk} "
-            f"rerank_delta_weight={policy.rerank_delta_weight:.6f} "
-            f"rerank_jerk_weight={policy.rerank_jerk_weight:.6f} "
-            f"rerank_action_l2_weight={policy.rerank_action_l2_weight:.6f} "
-            f"rerank_clip_weight={policy.rerank_clip_weight:.6f}"
+            f"refinement_topk={policy.refinement_topk}"
         )
         if bool(refinement_cfg["enabled"]):
             print(
@@ -1258,43 +1095,6 @@ def run(cfg: DictConfig):
                 f"smoothness_weight={float(refinement_cfg['smoothness_weight']):.6f} "
                 f"grad_clip_norm={refinement_cfg['grad_clip_norm']}"
             )
-        if bool(corrective_cfg["enabled"]):
-            effective_error_interval = int(
-                math.ceil(
-                    int(corrective_cfg["correction_interval"]) / int(policy.action_block)
-                )
-                * int(policy.action_block)
-            )
-            print(
-                "[corrective] "
-                f"mode={corrective_cfg['mode']} "
-                f"logging_prediction_error={int(corrective_cfg['logging']['log_prediction_error'])} "
-                f"correction_interval={int(corrective_cfg['correction_interval'])} "
-                f"effective_error_interval={effective_error_interval} "
-                f"effective_execute_horizon={policy.runtime_execute_steps} "
-                f"action_block={policy.action_block} "
-                f"error_threshold={float(corrective_cfg['error_threshold']):.6f} "
-                f"trigger_stat={corrective_cfg['trigger_stat']} "
-                f"trigger_quantile={float(corrective_cfg['trigger_quantile']):.6f} "
-                f"trigger_scope={corrective_cfg['trigger_scope']} "
-                f"error_metric={corrective_cfg['error_metric']} "
-                f"corrector_path={corrective_cfg['corrector_path']}"
-            )
-            if effective_error_interval != int(corrective_cfg["correction_interval"]):
-                print(
-                    "[corrective-warning] "
-                    "LeWM latent rollout is block-based, so prediction error "
-                    f"will be logged at step {effective_error_interval} instead of "
-                    f"requested correction_interval={int(corrective_cfg['correction_interval'])}."
-                )
-            if int(policy.runtime_execute_steps) < effective_error_interval:
-                print(
-                    "[corrective-warning] "
-                    "runtime_execute_steps is smaller than the effective prediction-error "
-                    "checkpoint, so this run may emit no prediction_error records. "
-                    "Use corrective.execute_horizon=null or set it >= effective_error_interval."
-                )
-
     else:
         raise ValueError(
             "Unsupported planner_type "
@@ -1405,65 +1205,7 @@ def run(cfg: DictConfig):
             if key in quality_summary:
                 print(f"[trajectory-quality] {key}={float(quality_summary[key]):.6f}")
 
-    prediction_error_summary = None
-    if (
-        planner_type == "diffusion"
-        and hasattr(policy, "get_prediction_error_summary")
-        and isinstance(metrics, dict)
-        and "episode_successes" in metrics
-    ):
-        prediction_error_summary = policy.get_prediction_error_summary(
-            metrics["episode_successes"]
-        )
-        if int(prediction_error_summary["prediction_error_count"]) > 0:
-            print(
-                "[corrective-summary] "
-                f"prediction_error_count={prediction_error_summary['prediction_error_count']} "
-                f"episode_mean_count={prediction_error_summary['prediction_error_episode_mean_count']} "
-                f"mean={float(prediction_error_summary['prediction_error_mean']):.6f} "
-                f"max={float(prediction_error_summary['prediction_error_max']):.6f}"
-            )
-            print(
-                "[corrective-summary] "
-                f"success_mean={float(prediction_error_summary['successful_prediction_error_mean']):.6f} "
-                f"failure_mean={float(prediction_error_summary['failed_prediction_error_mean']):.6f} "
-                f"fail_minus_success={float(prediction_error_summary['prediction_error_fail_minus_success']):.6f} "
-                f"fail_success_ratio={float(prediction_error_summary['prediction_error_fail_success_ratio']):.6f} "
-                f"cohens_d={float(prediction_error_summary['prediction_error_cohens_d_fail_vs_success']):.6f}"
-            )
-
     global_planning_calls = read_planning_stat(policy, "_num_replans")
-    corrective_check_count = (
-        getattr(policy, "_corrective_check_count", None) if planner_type == "diffusion" else None
-    )
-    corrective_replan_count = (
-        getattr(policy, "_corrective_replan_count", None) if planner_type == "diffusion" else None
-    )
-    corrective_replan_error_records = (
-        getattr(policy, "_corrective_replan_error_records", [])
-        if planner_type == "diffusion"
-        else []
-    )
-    corrective_correction_count = (
-        getattr(policy, "_corrective_correction_count", None) if planner_type == "diffusion" else None
-    )
-    corrective_correction_norms = (
-        getattr(policy, "_corrective_correction_norms", []) if planner_type == "diffusion" else []
-    )
-    corrective_action_delta_norms = (
-        getattr(policy, "_corrective_action_delta_norms", []) if planner_type == "diffusion" else []
-    )
-    corrective_correction_time_total_sec = (
-        getattr(policy, "_corrective_correction_time_total_sec", None)
-        if planner_type == "diffusion"
-        else None
-    )
-    corrective_replan_rate = None
-    corrective_replan_error_mean = None
-    corrective_replan_error_max = None
-    corrective_correction_norm_mean = None
-    corrective_action_delta_norm_mean = None
-    avg_correction_time_sec = None
     effective_replans_per_episode = None
     planning_time_total_sec = read_planning_stat(policy, "_planning_time_total_sec")
     generation_time_total_sec = read_planning_stat(policy, "_generation_time_total_sec")
@@ -1578,50 +1320,8 @@ def run(cfg: DictConfig):
         wm_rollout_time_total_with_refinement_sec = float(wm_rollout_time_total_sec or 0.0) + float(
             wm_refinement_rollout_time_total_sec or 0.0
         )
-    if corrective_check_count is not None and int(corrective_check_count) > 0:
-        corrective_replan_rate = float(corrective_replan_count or 0) / float(corrective_check_count)
-    if corrective_replan_error_records:
-        replan_errors = [
-            float(record.get("trigger_error", record["max_error"]))
-            for record in corrective_replan_error_records
-            if "max_error" in record
-        ]
-        if len(replan_errors) > 0:
-            corrective_replan_error_mean = float(np.mean(replan_errors))
-            corrective_replan_error_max = float(np.max(replan_errors))
-    if corrective_correction_norms:
-        corrective_correction_norm_mean = float(np.mean(corrective_correction_norms))
-    if corrective_action_delta_norms:
-        corrective_action_delta_norm_mean = float(np.mean(corrective_action_delta_norms))
-    if corrective_correction_count is not None and int(corrective_correction_count) > 0:
-        if corrective_correction_time_total_sec is not None:
-            avg_correction_time_sec = float(corrective_correction_time_total_sec) / float(corrective_correction_count)
     if global_planning_calls is not None:
         print(f"[planner-stats] global_planning_calls={global_planning_calls}")
-    if corrective_check_count is not None:
-        print(f"[corrective-stats] corrective_check_count={corrective_check_count}")
-    if corrective_replan_count is not None:
-        print(f"[corrective-stats] corrective_replan_count={corrective_replan_count}")
-    if corrective_replan_rate is not None:
-        print(f"[corrective-stats] corrective_replan_rate={corrective_replan_rate:.6f}")
-    if corrective_correction_count is not None:
-        print(f"[corrective-stats] corrective_correction_count={corrective_correction_count}")
-    if corrective_replan_error_mean is not None:
-        print(
-            "[corrective-stats] "
-            f"mean_prediction_error_before_replan={corrective_replan_error_mean:.6f} "
-            f"max_prediction_error_before_replan={corrective_replan_error_max:.6f}"
-        )
-    if corrective_correction_norm_mean is not None:
-        print(
-            "[corrective-stats] "
-            f"mean_correction_norm={corrective_correction_norm_mean:.6f} "
-            f"mean_action_delta_norm={corrective_action_delta_norm_mean:.6f}"
-        )
-    if corrective_correction_time_total_sec is not None:
-        print(f"[corrective-stats] correction_time_total_sec={float(corrective_correction_time_total_sec):.6f}")
-    if avg_correction_time_sec is not None:
-        print(f"[corrective-stats] avg_correction_time_sec={avg_correction_time_sec:.6f}")
     if effective_replans_per_episode is not None:
         print(f"[planner-stats] effective_replans_per_episode={effective_replans_per_episode}")
     if planning_time_total_sec is not None:
@@ -1756,10 +1456,6 @@ def run(cfg: DictConfig):
             f.write(f"diffusion_refinement_prior_weight: {float(refinement_cfg['prior_weight'])}\n")
             f.write(f"diffusion_refinement_smoothness_weight: {float(refinement_cfg['smoothness_weight'])}\n")
             f.write(f"diffusion_refinement_grad_clip_norm: {refinement_cfg['grad_clip_norm']}\n")
-            f.write(f"diffusion_rerank_delta_weight: {float(rerank_penalty_cfg['delta_weight'])}\n")
-            f.write(f"diffusion_rerank_jerk_weight: {float(rerank_penalty_cfg['jerk_weight'])}\n")
-            f.write(f"diffusion_rerank_action_l2_weight: {float(rerank_penalty_cfg['action_l2_weight'])}\n")
-            f.write(f"diffusion_rerank_clip_weight: {float(rerank_penalty_cfg['clip_weight'])}\n")
             f.write(f"goal_offset: {policy.goal_offset_steps}\n")
             f.write(f"eval_budget: {policy.eval_budget}\n")
             f.write(f"block_horizon: {policy.block_horizon}\n")
@@ -1770,42 +1466,11 @@ def run(cfg: DictConfig):
             f.write(f"action_chunk_dim: {int(policy.action_chunk_dim)}\n")
             f.write(f"runtime_execute_steps: {int(policy.runtime_execute_steps)}\n")
             f.write(f"replan_interval: {int(policy.flatten_receding_horizon)}\n")
-            f.write(f"corrective_enabled: {bool(corrective_cfg['enabled'])}\n")
-            f.write(f"corrective_mode: {corrective_cfg['mode']}\n")
-            f.write(f"corrective_correction_interval: {int(corrective_cfg['correction_interval'])}\n")
-            f.write(f"corrective_error_threshold: {float(corrective_cfg['error_threshold'])}\n")
-            f.write(f"corrective_trigger_stat: {corrective_cfg['trigger_stat']}\n")
-            f.write(f"corrective_trigger_quantile: {float(corrective_cfg['trigger_quantile'])}\n")
-            f.write(f"corrective_trigger_scope: {corrective_cfg['trigger_scope']}\n")
-            f.write(f"corrective_error_metric: {corrective_cfg['error_metric']}\n")
-            f.write(f"corrective_corrector_path: {corrective_cfg['corrector_path']}\n")
-            f.write(
-                "corrective_log_prediction_error: "
-                f"{bool(corrective_cfg['logging']['log_prediction_error'])}\n"
-            )
             action_clip_low, action_clip_high = policy.action_clip_range
             f.write(f"action_clip_low: {action_clip_low}\n")
             f.write(f"action_clip_high: {action_clip_high}\n")
         if global_planning_calls is not None:
             f.write(f"global_planning_calls: {global_planning_calls}\n")
-        if corrective_check_count is not None:
-            f.write(f"corrective_check_count: {corrective_check_count}\n")
-        if corrective_replan_count is not None:
-            f.write(f"corrective_replan_count: {corrective_replan_count}\n")
-        if corrective_replan_rate is not None:
-            f.write(f"corrective_replan_rate: {corrective_replan_rate}\n")
-        if corrective_correction_count is not None:
-            f.write(f"corrective_correction_count: {corrective_correction_count}\n")
-        if corrective_replan_error_mean is not None:
-            f.write(f"mean_prediction_error_before_replan: {corrective_replan_error_mean}\n")
-            f.write(f"max_prediction_error_before_replan: {corrective_replan_error_max}\n")
-        if corrective_correction_norm_mean is not None:
-            f.write(f"mean_correction_norm: {corrective_correction_norm_mean}\n")
-            f.write(f"mean_action_delta_norm: {corrective_action_delta_norm_mean}\n")
-        if corrective_correction_time_total_sec is not None:
-            f.write(f"correction_time_total_sec: {float(corrective_correction_time_total_sec)}\n")
-        if avg_correction_time_sec is not None:
-            f.write(f"avg_correction_time_sec: {avg_correction_time_sec}\n")
         if effective_replans_per_episode is not None:
             f.write(f"effective_replans_per_episode: {effective_replans_per_episode}\n")
         if planning_time_total_sec is not None:
@@ -1902,8 +1567,6 @@ def run(cfg: DictConfig):
                 np.savez_compressed(npz_path, **npz_payload)
                 f.write(f"trajectory_quality_npz: {npz_path}\n")
         f.write(f"metrics: {metrics}\n")
-        if prediction_error_summary is not None:
-            f.write(f"prediction_error_summary: {prediction_error_summary}\n")
         if success_rate is not None:
             f.write(f"success_rate: {float(success_rate)}\n")
         f.write(f"evaluation_time: {evaluation_time_sec} seconds\n")

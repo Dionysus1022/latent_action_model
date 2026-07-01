@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from trajectory_quality import (
+from evaluation.trajectory_quality import (
     compute_latent_monotonicity,
     compute_task_goal_distances,
     compute_trajectory_quality,

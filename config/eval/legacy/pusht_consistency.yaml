@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - /pusht
-  - _self_
-
-eval_profile: consistency

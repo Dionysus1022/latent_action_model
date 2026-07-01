@@ -48,10 +48,6 @@ def make_refinement_policy(*, enabled: bool):
     policy.refinement_smoothness_weight = 0.0
     policy.refinement_grad_clip_norm = None
     policy.score_topk = None
-    policy.rerank_delta_weight = 0.0
-    policy.rerank_jerk_weight = 0.0
-    policy.rerank_action_l2_weight = 0.0
-    policy.rerank_clip_weight = 0.0
     policy._last_refinement_cost_before = None
     policy._last_refinement_cost_after = None
     policy._last_refinement_goal_cost_before = None
@@ -185,48 +181,6 @@ class DiffusionPolicyRefinementTest(unittest.TestCase):
         self.assertTrue(torch.equal(refined[:, 0, :], candidates[:, 0, :]))
         self.assertFalse(torch.equal(refined[:, 1, :], candidates[:, 1, :]))
         self.assertEqual(policy._last_refinement_candidate_count, 1)
-
-    def test_smoothness_penalty_can_override_lower_world_model_cost(self):
-        policy = make_refinement_policy(enabled=False)
-        policy.selection_mode = "wm_only"
-        policy.planner.plan_horizon = 4
-        policy.planner.action_dim = 1
-        policy.planner.action_chunk_dim = 4
-        policy.rerank_delta_weight = 1.0
-        policy.rerank_jerk_weight = 1.0
-        candidates = torch.tensor([[[0.0, 2.0, -2.0, 2.0], [0.2, 0.2, 0.2, 0.2]]])
-        world_model_costs = torch.tensor([[0.0, 1.0]])
-        model_scores = torch.tensor([[0.0, 0.0]])
-
-        selected, selected_indices, _ = policy.select_best_candidates(
-            candidates,
-            world_model_costs,
-            model_scores,
-        )
-
-        self.assertEqual(selected_indices.tolist(), [1])
-        self.assertTrue(torch.equal(selected, candidates[:, 1, :]))
-
-    def test_clip_penalty_prefers_in_range_candidate(self):
-        policy = make_refinement_policy(enabled=False)
-        policy.selection_mode = "wm_only"
-        policy.planner.plan_horizon = 2
-        policy.planner.action_dim = 1
-        policy.planner.action_chunk_dim = 2
-        policy.rerank_clip_weight = 10.0
-        policy._action_low = torch.tensor([-1.0]).numpy()
-        policy._action_high = torch.tensor([1.0]).numpy()
-        candidates = torch.tensor([[[1.5, 1.5], [0.9, 0.9]]])
-        world_model_costs = torch.tensor([[0.0, 1.0]])
-        model_scores = torch.tensor([[0.0, 0.0]])
-
-        _, selected_indices, _ = policy.select_best_candidates(
-            candidates,
-            world_model_costs,
-            model_scores,
-        )
-
-        self.assertEqual(selected_indices.tolist(), [1])
 
     def test_score_topk_wm_scores_only_score_prefiltered_candidates(self):
         policy = make_refinement_policy(enabled=False)

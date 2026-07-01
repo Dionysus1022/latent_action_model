@@ -9,9 +9,7 @@ class EvalPlannerConfigTests(unittest.TestCase):
         cases = {
             "cube_mpc": ["cube", "mpc"],
             "pusht_diffusion": ["pusht", "diffusion"],
-            "reacher_consistency": ["reacher", "consistency"],
             "tworoom_diffusion": ["tworoom", "diffusion"],
-            "pusht_diffusion_corrective": ["pusht", "corrective_learned"],
         }
 
         for legacy_name, (task_name, profile_name) in cases.items():
@@ -25,39 +23,9 @@ class EvalPlannerConfigTests(unittest.TestCase):
                     ["eval.py", f"--config-name={task_name}", f"eval_profile={profile_name}"],
                 )
 
-    def test_legacy_yaml_files_are_archived_outside_eval_root(self) -> None:
+    def test_legacy_yaml_files_are_removed_from_eval_config_tree(self) -> None:
         config_dir = Path(__file__).resolve().parents[1] / "config" / "eval"
-        legacy_files = {
-            "cube_mpc.yaml",
-            "cube_diffusion.yaml",
-            "cube_consistency.yaml",
-            "pusht_mpc.yaml",
-            "pusht_diffusion.yaml",
-            "pusht_consistency.yaml",
-            "pusht_diffusion_corrective.yaml",
-            "reacher_mpc.yaml",
-            "reacher_diffusion.yaml",
-            "reacher_consistency.yaml",
-            "tworoom_mpc.yaml",
-            "tworoom_diffusion.yaml",
-            "tworoom_consistency.yaml",
-        }
-
-        for filename in legacy_files:
-            with self.subTest(filename=filename):
-                self.assertFalse((config_dir / filename).exists())
-                self.assertTrue((config_dir / "legacy" / filename).exists())
-
-    def test_archived_legacy_yaml_files_still_compose_at_global_package(self) -> None:
-        import hydra
-
-        config_dir = str(Path(__file__).resolve().parents[1] / "config" / "eval")
-        with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
-            cfg = hydra.compose(config_name="legacy/pusht_diffusion")
-
-        self.assertNotIn("legacy", cfg)
-        self.assertEqual(cfg.task, "pusht")
-        self.assertEqual(cfg.eval_profile, "diffusion")
+        self.assertFalse((config_dir / "legacy").exists())
 
     def test_legacy_task_flag_maps_to_mpc_config(self) -> None:
         from eval import normalize_eval_cli_args
@@ -172,36 +140,66 @@ class EvalPlannerConfigTests(unittest.TestCase):
                 self.assertAlmostEqual(cfg.diffusion_refinement.grad_clip_norm, 1.0)
                 self.assertNotIn("solver", cfg)
 
-    def test_pusht_corrective_diffusion_config_sets_phase3_defaults(self) -> None:
+    def test_eval_task_configs_include_explicit_dataset_h5(self) -> None:
+        import hydra
+
+        config_dir = str(Path(__file__).resolve().parents[1] / "config" / "eval")
+        expected = {
+            "cube": "/data/ykz/cube/cube_single_expert.h5",
+            "pusht": "/data/ykz/pusht/pusht_expert_train.h5",
+            "reacher": "/data/ykz/reacher/reacher.h5",
+            "tworoom": "/data/ykz/tworoom/tworoom.h5",
+        }
+
+        with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
+            for config_name, dataset_h5 in expected.items():
+                with self.subTest(config_name=config_name):
+                    cfg = hydra.compose(config_name=config_name)
+                    self.assertEqual(cfg.dataset_h5, dataset_h5)
+                    self.assertNotIn("stats", cfg.dataset)
+
+    def test_reacher_h10_eval_profiles_resolve_runtime_overrides(self) -> None:
         import hydra
         from eval import resolve_eval_profile_config
 
         config_dir = str(Path(__file__).resolve().parents[1] / "config" / "eval")
         with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
-            cfg = resolve_eval_profile_config(
+            wm_only = resolve_eval_profile_config(
                 hydra.compose(
-                    config_name="pusht",
-                    overrides=["eval_profile=corrective_learned"],
+                    config_name="reacher",
+                    overrides=["eval_profile=diffusion_h10_wm_only"],
+                )
+            )
+            score_top16_wm = resolve_eval_profile_config(
+                hydra.compose(
+                    config_name="reacher",
+                    overrides=["eval_profile=diffusion_h10_score_top16_wm"],
                 )
             )
 
-        self.assertEqual(cfg.planner_type, "diffusion")
-        self.assertEqual(cfg.policy, "/data/ykz/pusht/lewm_epoch_100")
+        self.assertEqual(wm_only.planner_type, "diffusion")
+        self.assertEqual(wm_only.diffusion_selection_mode, "wm_only")
+        self.assertEqual(wm_only.diffusion_num_candidates, 128)
+        self.assertEqual(wm_only.diffusion_runtime_execute_steps, 10)
+        self.assertEqual(wm_only.plan_config.horizon, 5)
+        self.assertEqual(wm_only.plan_config.receding_horizon, 2)
+        self.assertEqual(wm_only.plan_config.action_block, 5)
         self.assertEqual(
-            cfg.diffusion_bundle,
-            "/data/ykz/pusht/diffusion_pipeline/pusht_diffusion_k128_200000/diffusion_planner_best_bundle.pt",
+            wm_only.diffusion_bundle,
+            "/data/ykz/reacher/diffusion_pipeline/reacher_h10_diffusion_200k_simple_bce_k128_raw/diffusion_planner_best_bundle.pt",
         )
-        self.assertTrue(cfg.corrective.enabled)
-        self.assertEqual(cfg.corrective.mode, "learned")
+
+        self.assertEqual(score_top16_wm.planner_type, "diffusion")
+        self.assertEqual(score_top16_wm.diffusion_selection_mode, "score_topk_wm")
+        self.assertEqual(score_top16_wm.diffusion_score_topk, 16)
+        self.assertEqual(score_top16_wm.diffusion_num_candidates, 128)
+        self.assertEqual(score_top16_wm.diffusion_runtime_execute_steps, 10)
+        self.assertEqual(score_top16_wm.plan_config.receding_horizon, 2)
+        self.assertEqual(score_top16_wm.plan_config.action_block, 5)
         self.assertEqual(
-            cfg.corrective.corrector_path,
-            "/data/ykz/pusht/diffusion_pipeline/pusht_corrector_ci5/corrector_best_bundle.pt",
+            score_top16_wm.diffusion_bundle,
+            "/data/ykz/reacher/diffusion_pipeline/reacher_h10_score_head_mlp_top16_margin/diffusion_planner_best_bundle.pt",
         )
-        self.assertTrue(cfg.corrective.logging.log_prediction_error)
-        self.assertEqual(cfg.corrective.correction_interval, 5)
-        self.assertEqual(cfg.corrective.execute_horizon, 25)
-        self.assertEqual(cfg.corrective.trigger_scope, "per_env")
-        self.assertAlmostEqual(cfg.corrective.error_threshold, 5.0)
 
     def test_pusht_eval_profiles_resolve_to_concrete_planner_configs(self) -> None:
         import hydra
@@ -213,13 +211,8 @@ class EvalPlannerConfigTests(unittest.TestCase):
                 config_name="pusht",
                 overrides=["eval_profile=diffusion"],
             )
-            corrective_cfg = hydra.compose(
-                config_name="pusht",
-                overrides=["eval_profile=corrective_learned"],
-            )
 
         diffusion = resolve_eval_profile_config(diffusion_cfg)
-        corrective = resolve_eval_profile_config(corrective_cfg)
 
         self.assertEqual(diffusion.planner_type, "diffusion")
         self.assertEqual(diffusion.policy, "/data/ykz/pusht/lewm_epoch_100")
@@ -227,18 +220,10 @@ class EvalPlannerConfigTests(unittest.TestCase):
             diffusion.diffusion_bundle,
             "/data/ykz/pusht/diffusion_pipeline/pusht_diffusion_k128_200000/diffusion_planner_best_bundle.pt",
         )
-        self.assertFalse(diffusion.corrective.enabled)
-        self.assertEqual(corrective.planner_type, "diffusion")
-        self.assertTrue(corrective.corrective.enabled)
-        self.assertEqual(corrective.corrective.mode, "learned")
-        self.assertEqual(corrective.corrective.correction_interval, 5)
-        self.assertEqual(corrective.corrective.execute_horizon, 25)
-        self.assertAlmostEqual(corrective.corrective.error_threshold, 5.0)
 
     def test_profile_overrides_keep_explicit_null_default_values(self) -> None:
         import hydra
         from eval import (
-            resolve_corrective_config,
             resolve_diffusion_refinement_config,
             resolve_eval_profile_config,
         )
@@ -248,22 +233,16 @@ class EvalPlannerConfigTests(unittest.TestCase):
             cfg = hydra.compose(
                 config_name="pusht",
                 overrides=[
-                    "eval_profile=corrective_learned",
-                    "corrective.error_threshold=0.5",
+                    "eval_profile=diffusion",
                     "diffusion_refinement.enabled=true",
                 ],
             )
             base_cfg = hydra.compose(config_name="pusht")
 
         resolved = resolve_eval_profile_config(cfg)
-        corrective = resolve_corrective_config(base_cfg)
         refinement = resolve_diffusion_refinement_config(base_cfg)
 
-        self.assertTrue(resolved.corrective.enabled)
-        self.assertAlmostEqual(resolved.corrective.error_threshold, 0.5)
         self.assertTrue(resolved.diffusion_refinement.enabled)
-        self.assertEqual(corrective["mode"], "none")
-        self.assertFalse(corrective["enabled"])
         self.assertFalse(refinement["enabled"])
 
     def test_profile_scalar_diffusion_overrides_use_normal_hydra_syntax(self) -> None:

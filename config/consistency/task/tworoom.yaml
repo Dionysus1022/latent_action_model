@@ -1,6 +1,0 @@
-name: tworoom
-data_root: /data/ykz/tworoom
-planner_dataset_path: /data/ykz/tworoom/diffusion_pipeline/tworoom_planner_dataset.pt
-diffusion_bundle_path: /data/ykz/tworoom/diffusion_pipeline/tworoom_diffusion_k128_200000/diffusion_planner_best_bundle.pt
-consistency_output_dir: /data/ykz/tworoom/diffusion_pipeline/consistency
-wm_policy: /data/ykz/tworoom/lewm_epoch_67

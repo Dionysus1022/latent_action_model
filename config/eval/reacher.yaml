@@ -5,18 +5,18 @@ defaults:
 world:
   env_name: swm/ReacherDMControl-v0
   num_envs: ${eval.num_eval}
-  max_episode_steps: ??? # make sure it's >= eval_budget
+  max_episode_steps: ${eval.eval_budget}
   history_size: 1
   frame_skip: 1
   task: qpos_match
 
 dataset:
-  stats: ${eval.dataset_name}
   keys_to_cache:
     - action
 
 seed: 42
 task: reacher
+dataset_h5: /data/ykz/reacher/reacher.h5
 eval_profile: null
 
 plan_config:
@@ -85,35 +85,13 @@ diffusion_refinement: &diffusion_refinement_defaults
   smoothness_weight: null
   grad_clip_norm: null
 
-diffusion_rerank_penalty: &diffusion_rerank_penalty_defaults
-  delta_weight: null
-  jerk_weight: null
-  action_l2_weight: null
-  clip_weight: null
-
-corrective: &corrective_defaults
-  enabled: null
-  mode: null
-  corrector_path: null
-  correction_interval: null
-  execute_horizon: null
-  error_threshold: null
-  trigger_stat: null
-  trigger_quantile: null
-  trigger_scope: null
-  error_metric: null
-  logging:
-    log_prediction_error: null
-    log_correction_norm: null
-    log_replan_count: null
-
 profiles:
   mpc:
     planner_type: mpc
     policy: /data/ykz/reacher/lewm_epoch_29
     solver:
       <<: *cem_solver
-  diffusion: &reacher_diffusion_profile
+  diffusion:
     planner_type: diffusion
     policy: /data/ykz/reacher/lewm_epoch_29
     diffusion_bundle: /data/ykz/reacher/diffusion_pipeline/reacher_diffusion_k128_200000/diffusion_planner_best_bundle.pt
@@ -136,27 +114,57 @@ profiles:
       prior_weight: 0.05
       smoothness_weight: 0.005
       grad_clip_norm: 1.0
-    diffusion_rerank_penalty:
-      <<: *diffusion_rerank_penalty_defaults
-      delta_weight: 0.0
-      jerk_weight: 0.0
-      action_l2_weight: 0.0
-      clip_weight: 0.0
-    corrective:
-      <<: *corrective_defaults
+  diffusion_h10_wm_only:
+    planner_type: diffusion
+    policy: /data/ykz/reacher/lewm_epoch_29
+    plan_config:
+      horizon: 5
+      receding_horizon: 2
+      action_block: 5
+    diffusion_bundle: /data/ykz/reacher/diffusion_pipeline/reacher_h10_diffusion_200k_simple_bce_k128_raw/diffusion_planner_best_bundle.pt
+    diffusion_selection_mode: wm_only
+    diffusion_score_topk: null
+    diffusion_num_candidates: 128
+    diffusion_truncation_steps: null
+    diffusion_start_timestep: null
+    diffusion_eta: 0.0
+    diffusion_noise_scale: 1.0
+    diffusion_sampling_temperature: 1.0
+    diffusion_runtime_execute_steps: 10
+    diffusion_refinement:
+      <<: *diffusion_refinement_defaults
       enabled: false
-      mode: none
-      correction_interval: 2
-      error_threshold: 0.5
-      trigger_stat: max
-      trigger_quantile: 0.9
-      trigger_scope: per_env
-      error_metric: l2
-      logging:
-        log_prediction_error: false
-        log_correction_norm: true
-        log_replan_count: true
-  consistency:
-    <<: *reacher_diffusion_profile
-    diffusion_bundle: /data/ykz/reacher/diffusion_pipeline/consistency/consistency_planner_best_bundle.pt
-    diffusion_truncation_steps: 1
+      steps: 1
+      step_size: 0.03
+      topk: 16
+      goal_weight: 1.0
+      prior_weight: 0.05
+      smoothness_weight: 0.005
+      grad_clip_norm: 1.0
+  diffusion_h10_score_top16_wm:
+    planner_type: diffusion
+    policy: /data/ykz/reacher/lewm_epoch_29
+    plan_config:
+      horizon: 5
+      receding_horizon: 2
+      action_block: 5
+    diffusion_bundle: /data/ykz/reacher/diffusion_pipeline/reacher_h10_score_head_mlp_top16_margin/diffusion_planner_best_bundle.pt
+    diffusion_selection_mode: score_topk_wm
+    diffusion_score_topk: 16
+    diffusion_num_candidates: 128
+    diffusion_truncation_steps: null
+    diffusion_start_timestep: null
+    diffusion_eta: 0.0
+    diffusion_noise_scale: 1.0
+    diffusion_sampling_temperature: 1.0
+    diffusion_runtime_execute_steps: 10
+    diffusion_refinement:
+      <<: *diffusion_refinement_defaults
+      enabled: false
+      steps: 1
+      step_size: 0.03
+      topk: 16
+      goal_weight: 1.0
+      prior_weight: 0.05
+      smoothness_weight: 0.005
+      grad_clip_norm: 1.0

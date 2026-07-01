@@ -1,5 +1,0 @@
-name: tworoom
-data_root: /data/ykz/tworoom
-planner_dataset_path: /data/ykz/tworoom/diffusion_pipeline/tworoom_planner_dataset.pt
-wm_policy: /data/ykz/tworoom/lewm_epoch_100
-output_dir: /data/ykz/tworoom/diffusion_pipeline/tworoom_corrector_ci${corrective.correction_interval}

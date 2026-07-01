@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - /cube
-  - _self_
-
-eval_profile: diffusion

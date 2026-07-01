@@ -5,7 +5,7 @@ defaults:
 world:
   env_name: swm/OGBCube-v0
   num_envs: ${eval.num_eval}
-  max_episode_steps: ??? # make sure it's >= eval_budget
+  max_episode_steps: ${eval.eval_budget}
   history_size: 1
   frame_skip: 1
   env_type: single
@@ -17,11 +17,12 @@ world:
   terminate_at_goal: True
 
 dataset:
-  stats: ${eval.dataset_name}
   keys_to_cache:
     - action
 
 seed: 42
+task: cube
+dataset_h5: /data/ykz/cube/cube_single_expert.h5
 eval_profile: null
 
 plan_config:
@@ -95,35 +96,13 @@ diffusion_refinement: &diffusion_refinement_defaults
   smoothness_weight: null
   grad_clip_norm: null
 
-diffusion_rerank_penalty: &diffusion_rerank_penalty_defaults
-  delta_weight: null
-  jerk_weight: null
-  action_l2_weight: null
-  clip_weight: null
-
-corrective: &corrective_defaults
-  enabled: null
-  mode: null
-  corrector_path: null
-  correction_interval: null
-  execute_horizon: null
-  error_threshold: null
-  trigger_stat: null
-  trigger_quantile: null
-  trigger_scope: null
-  error_metric: null
-  logging:
-    log_prediction_error: null
-    log_correction_norm: null
-    log_replan_count: null
-
 profiles:
   mpc:
     planner_type: mpc
     policy: /data/ykz/cube/lewm_epoch_27
     solver:
       <<: *cem_solver
-  diffusion: &cube_diffusion_profile
+  diffusion:
     planner_type: diffusion
     policy: /data/ykz/cube/lewm_epoch_27
     diffusion_bundle: /data/ykz/cube/diffusion_pipeline/cube_diffusion_k128_200000/diffusion_planner_best_bundle.pt
@@ -146,27 +125,3 @@ profiles:
       prior_weight: 0.05
       smoothness_weight: 0.005
       grad_clip_norm: 1.0
-    diffusion_rerank_penalty:
-      <<: *diffusion_rerank_penalty_defaults
-      delta_weight: 0.0
-      jerk_weight: 0.0
-      action_l2_weight: 0.0
-      clip_weight: 0.0
-    corrective:
-      <<: *corrective_defaults
-      enabled: false
-      mode: none
-      correction_interval: 2
-      error_threshold: 0.5
-      trigger_stat: max
-      trigger_quantile: 0.9
-      trigger_scope: per_env
-      error_metric: l2
-      logging:
-        log_prediction_error: false
-        log_correction_norm: true
-        log_replan_count: true
-  consistency:
-    <<: *cube_diffusion_profile
-    diffusion_bundle: /data/ykz/cube/diffusion_pipeline/consistency/consistency_planner_best_bundle.pt
-    diffusion_truncation_steps: 1

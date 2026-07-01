@@ -41,30 +41,32 @@ class ComparisonExperimentPipelineTests(unittest.TestCase):
             python_bin=Path("/repo/.venv/bin/python"),
         )
 
-        self.assertIn("+dataset_h5=/data/ykz/cube/cube_single_expert.h5", cube_command)
         self.assertIn("diffusion_selection_mode=wm_only", cube_command)
         self.assertIn("diffusion_refinement.enabled=true", cube_command)
         self.assertIn("eval_profile=diffusion", reacher_command)
         self.assertIn("diffusion_selection_mode=wm_only", reacher_command)
         self.assertIn("diffusion_refinement.enabled=true", reacher_command)
-        self.assertIn("+dataset_h5=/data/ykz/reacher/reacher.h5", reacher_command)
-        self.assertIn("eval_profile=corrective_learned", pusht_command)
+        self.assertIn("eval_profile=diffusion", pusht_command)
         self.assertIn("diffusion_selection_mode=wm_only", pusht_command)
         self.assertIn("diffusion_refinement.enabled=true", pusht_command)
-        self.assertIn("+dataset_h5=/data/ykz/pusht/pusht_expert_train.h5", pusht_command)
         self.assertIn("seed=42", pusht_command)
         self.assertIn("trajectory_quality.enabled=true", pusht_command)
         self.assertIn("trajectory_quality.save_video=false", pusht_command)
+        self.assertNotIn("+dataset_h5=/data/ykz/cube/cube_single_expert.h5", cube_command)
+        self.assertNotIn("+dataset_h5=/data/ykz/reacher/reacher.h5", reacher_command)
+        self.assertNotIn("+dataset_h5=/data/ykz/pusht/pusht_expert_train.h5", pusht_command)
 
-    def test_every_run_uses_explicit_dataset_h5(self) -> None:
+    def test_eval_py_runs_do_not_override_config_dataset_h5(self) -> None:
         from scripts.run_comparison_experiments import build_eval_command, build_run_matrix, default_experiment_spec
 
         spec = default_experiment_spec()
         for run in build_run_matrix(spec):
             command = build_eval_command(run, spec=spec, python_bin=Path("/repo/.venv/bin/python"))
-            self.assertTrue(
-                any(arg.startswith("+dataset_h5=") or arg == "--dataset-h5" for arg in command),
-                f"missing dataset override for {run}",
+            if "eval.py" not in command[1]:
+                continue
+            self.assertFalse(
+                any(arg.startswith("+dataset_h5=") for arg in command),
+                f"unexpected dataset override for {run}",
             )
 
     def test_lgbs_commands_use_external_eval_scripts_and_local_paths(self) -> None:
@@ -106,7 +108,6 @@ class ComparisonExperimentPipelineTests(unittest.TestCase):
 [planner] type=diffusion task=pusht config=pusht policy=/data/ykz/pusht/lewm_epoch_100 bundle=/data/ykz/pusht/diffusion_pipeline/pusht_diffusion_k128_200000/diffusion_planner_best_bundle.pt goal_offset=25 eval_budget=50 block_horizon=5 receding_horizon=5 action_block=5 action_chunk_horizon=25 action_chunk_dim=50 runtime_execute_steps=25 replan_interval=25 action_dim=2 base_num_candidates=128 num_candidates=128 proposal_rounds=1 denoise_steps=4 start_timestep=15 eta=0.0000 noise_scale=1.0000 temperature=1.0000 selection_mode=wm_only refinement_enabled=1 refinement_steps=1 refinement_step_size=0.030000 refinement_topk=16
 [planner-runtime] planner_type=diffusion task=pusht config=pusht policy=/data/ykz/pusht/lewm_epoch_100 diffusion_bundle=/data/ykz/pusht/diffusion_pipeline/pusht_diffusion_k128_200000/diffusion_planner_best_bundle.pt goal_offset=25 eval_budget=50 block_horizon=5 receding_horizon=5 action_block=5 action_chunk_horizon=25 action_dim=2 action_chunk_dim=50 num_candidates=128 selection_mode=wm_only action_clip_low=-1.0 action_clip_high=1.0
 [refinement] enabled=1 steps=1 step_size=0.030000 topk=16 goal_weight=1.000000 prior_weight=0.050000 smoothness_weight=0.005000 grad_clip_norm=1.0
-[corrective] mode=learned logging_prediction_error=1 correction_interval=5 effective_error_interval=5 effective_execute_horizon=25 action_block=5 error_threshold=5.000000 trigger_stat=max trigger_quantile=0.900000 trigger_scope=per_env error_metric=l2 corrector_path=/data/ykz/pusht/diffusion_pipeline/pusht_corrector_ci5/corrector_best_bundle.pt
 [summary] success_rate=94.0000
 [summary] episode_successes=1,0,1
 [summary] evaluation_time=38.2629s
@@ -127,16 +128,6 @@ class ComparisonExperimentPipelineTests(unittest.TestCase):
 [planner-stats] avg_refinement_time_sec=0.005000
 [planner-stats] avg_scoring_time_sec=2.609443
 [planner-stats] avg_selection_time_sec=0.008418
-[corrective-stats] corrective_check_count=9
-[corrective-stats] corrective_replan_count=1
-[corrective-stats] corrective_replan_rate=0.500000
-[corrective-stats] corrective_correction_count=1
-[corrective-stats] mean_prediction_error_before_replan=16.795120 max_prediction_error_before_replan=16.795120
-[corrective-stats] mean_correction_norm=0.100000 mean_action_delta_norm=0.200000
-[corrective-stats] correction_time_total_sec=0.004000
-[corrective-stats] avg_correction_time_sec=0.002000
-[corrective-summary] prediction_error_count=450 episode_mean_count=50 mean=2.315576 max=19.738548
-[corrective-summary] success_mean=2.142556 failure_mean=5.026225 fail_minus_success=2.883669 fail_success_ratio=2.345901 cohens_d=2.543583
 [refinement-summary] candidate_count=16 steps=1 cost_before=8.000000 cost_after=7.000000 goal_before=6.000000 goal_after=5.000000 delta_norm=0.123000
 [diffusion-rerank] mode=wm_only goal_offset=25 block_horizon=5 action_chunk_horizon=25 runtime_execute_steps=25 replan_interval=25 base_num_candidates=128 proposal_rounds=1 num_candidates=128 denoise_steps=4 start_timestep=15 eta=0.0000 noise_scale=1.0000 temperature=1.0000 finite_candidate_rate=1.0000 all_bad_env_rate=0.0000 fallback_rate=0.0000
 [diffusion-rerank] selected_index_first=97 selected_wm_cost_first=17.719501 selected_model_score_first=-4.194184 selected_wm_cost_mean=67.065857 selected_model_score_mean=-6.907038
@@ -169,26 +160,6 @@ class ComparisonExperimentPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["avg_refinement_time_sec"], 0.005)
         self.assertAlmostEqual(metrics["action_l2_mean_mean"], 0.7)
         self.assertAlmostEqual(metrics["action_delta_l2_mean_mean"], 0.4)
-        self.assertEqual(metrics["corrective_correction_count"], 1)
-        self.assertEqual(metrics["corrective_check_count"], 9)
-        self.assertEqual(metrics["corrective_replan_count"], 1)
-        self.assertEqual(metrics["corrective_mode"], "learned")
-        self.assertEqual(metrics["corrective_trigger_scope"], "per_env")
-        self.assertEqual(
-            metrics["corrector_path"],
-            "/data/ykz/pusht/diffusion_pipeline/pusht_corrector_ci5/corrector_best_bundle.pt",
-        )
-        self.assertAlmostEqual(metrics["prediction_error_mean"], 2.315576)
-        self.assertAlmostEqual(metrics["prediction_error_max"], 19.738548)
-        self.assertAlmostEqual(metrics["successful_prediction_error_mean"], 2.142556)
-        self.assertAlmostEqual(metrics["failed_prediction_error_mean"], 5.026225)
-        self.assertAlmostEqual(metrics["prediction_error_fail_success_ratio"], 2.345901)
-        self.assertAlmostEqual(metrics["prediction_error_cohens_d_fail_vs_success"], 2.543583)
-        self.assertAlmostEqual(metrics["mean_prediction_error_before_replan"], 16.795120)
-        self.assertAlmostEqual(metrics["max_prediction_error_before_replan"], 16.795120)
-        self.assertAlmostEqual(metrics["mean_correction_norm"], 0.1)
-        self.assertAlmostEqual(metrics["mean_action_delta_norm"], 0.2)
-        self.assertAlmostEqual(metrics["correction_time_total_sec"], 0.004)
         self.assertAlmostEqual(metrics["finite_candidate_rate"], 1.0)
         self.assertAlmostEqual(metrics["fallback_rate"], 0.0)
         self.assertAlmostEqual(metrics["all_bad_env_rate"], 0.0)
@@ -284,21 +255,6 @@ class ComparisonExperimentPipelineTests(unittest.TestCase):
             "all_bad_env_rate",
             "selected_wm_cost_mean",
             "selected_model_score_mean",
-            "corrective_check_count",
-            "corrective_replan_count",
-            "corrective_replan_rate",
-            "corrective_correction_count",
-            "prediction_error_mean",
-            "prediction_error_max",
-            "successful_prediction_error_mean",
-            "failed_prediction_error_mean",
-            "prediction_error_cohens_d_fail_vs_success",
-            "mean_prediction_error_before_replan",
-            "max_prediction_error_before_replan",
-            "mean_correction_norm",
-            "mean_action_delta_norm",
-            "correction_time_total_sec",
-            "avg_correction_time_sec",
             "command",
             "log_path",
         }
@@ -671,9 +627,6 @@ class ComparisonExperimentPipelineTests(unittest.TestCase):
                 self.assertTrue(bool(cfg.diffusion_refinement.enabled), run)
                 self.assertEqual(cfg.diffusion_refinement.steps, 1)
                 self.assertEqual(cfg.diffusion_refinement.topk, 16)
-                if run.task == "pusht":
-                    self.assertTrue(bool(cfg.corrective.enabled))
-                    self.assertIn(str(cfg.corrective.mode), {"learned", "replan"})
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-import math
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
@@ -13,21 +12,10 @@ import torch
 from stable_worldmodel import PlanConfig
 from stable_worldmodel.policy import BasePolicy
 
-from diffusion.corrector import (
-    ActionChunkCorrector,
-    CorrectorBundle,
-    load_corrector_bundle,
-)
 from diffusion.model import (
     DiffusionPlannerBundle,
     DiffusionPlannerModel,
     load_diffusion_planner_bundle,
-)
-from diffusion.prediction_error import (
-    compute_prediction_error,
-    compute_trigger_error,
-    resolve_prediction_error_check,
-    summarize_prediction_error_records,
 )
 from planners.latent_rollout import latent_rollout
 from planners.single_peak_data import clone_info_dict, unflatten_action_chunk
@@ -51,19 +39,6 @@ class DiffusionRuntimeSpec:
     action_block: int
     goal_offset_steps: int | None
     eval_budget: int | None
-
-
-@dataclass(frozen=True)
-class PredictionErrorCheckpoint:
-    step: int
-    plan_index: int
-    rollout_blocks: int
-    z_real: torch.Tensor
-    z_pred: torch.Tensor
-    z_goal: torch.Tensor
-    errors: torch.Tensor
-    max_error: float
-    mean_error: float
 
 
 def normalize_task_name(task_name: str | None) -> str | None:
@@ -141,18 +116,6 @@ class DiffusionPlannerPolicy(BasePolicy):
         goal_offset_steps: int | None = None,
         eval_budget: int | None = None,
         runtime_execute_steps: int | None = None,
-        corrective_enabled: bool = False,
-        corrective_mode: str = "none",
-        corrective_correction_interval: int = 2,
-        corrective_error_threshold: float = 0.5,
-        corrective_trigger_stat: str = "max",
-        corrective_trigger_quantile: float = 0.9,
-        corrective_trigger_scope: str = "per_env",
-        corrective_error_metric: str = "l2",
-        corrective_log_prediction_error: bool = False,
-        corrector: ActionChunkCorrector | None = None,
-        corrector_bundle: CorrectorBundle | None = None,
-        corrector_path: str | Path | None = None,
         refinement_enabled: bool = False,
         refinement_steps: int = 1,
         refinement_step_size: float = 0.03,
@@ -161,10 +124,6 @@ class DiffusionPlannerPolicy(BasePolicy):
         refinement_prior_weight: float = 0.05,
         refinement_smoothness_weight: float = 0.005,
         refinement_grad_clip_norm: float | None = None,
-        rerank_delta_weight: float = 0.0,
-        rerank_jerk_weight: float = 0.0,
-        rerank_action_l2_weight: float = 0.0,
-        rerank_clip_weight: float = 0.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -195,18 +154,6 @@ class DiffusionPlannerPolicy(BasePolicy):
         self.requested_runtime_execute_steps = (
             None if runtime_execute_steps is None else int(runtime_execute_steps)
         )
-        self.corrective_enabled = bool(corrective_enabled)
-        self.corrective_mode = str(corrective_mode).lower().strip()
-        self.corrective_correction_interval = int(corrective_correction_interval)
-        self.corrective_error_threshold = float(corrective_error_threshold)
-        self.corrective_trigger_stat = str(corrective_trigger_stat).lower().strip()
-        self.corrective_trigger_quantile = float(corrective_trigger_quantile)
-        self.corrective_trigger_scope = str(corrective_trigger_scope).lower().strip()
-        self.corrective_error_metric = str(corrective_error_metric).lower().strip()
-        self.corrective_log_prediction_error = bool(corrective_log_prediction_error)
-        self.corrector = None if corrector is None else corrector.to(planner_device).eval()
-        self.corrector_bundle = corrector_bundle
-        self.corrector_path = None if corrector_path in [None, "", "null"] else str(corrector_path)
         self.refinement_enabled = bool(refinement_enabled)
         self.refinement_steps = int(refinement_steps)
         self.refinement_step_size = float(refinement_step_size)
@@ -217,10 +164,6 @@ class DiffusionPlannerPolicy(BasePolicy):
         self.refinement_grad_clip_norm = (
             None if refinement_grad_clip_norm is None else float(refinement_grad_clip_norm)
         )
-        self.rerank_delta_weight = float(rerank_delta_weight)
-        self.rerank_jerk_weight = float(rerank_jerk_weight)
-        self.rerank_action_l2_weight = float(rerank_action_l2_weight)
-        self.rerank_clip_weight = float(rerank_clip_weight)
         self.runtime_spec = self._resolve_runtime_spec(config=config)
 
         self._action_buffer: deque[torch.Tensor] = deque(maxlen=self.runtime_execute_steps)
@@ -252,16 +195,6 @@ class DiffusionPlannerPolicy(BasePolicy):
         self._current_plan_start_latent: torch.Tensor | None = None
         self._current_plan_index = 0
         self._current_plan_executed_steps = 0
-        self._logged_prediction_error_steps: set[int] = set()
-        self._checked_prediction_error_steps: set[int] = set()
-        self._prediction_error_records: list[dict[str, float | int | str]] = []
-        self._corrective_check_count = 0
-        self._corrective_replan_count = 0
-        self._corrective_replan_error_records: list[dict[str, float | int | str]] = []
-        self._corrective_correction_count = 0
-        self._corrective_correction_norms: list[float] = []
-        self._corrective_action_delta_norms: list[float] = []
-        self._corrective_correction_time_total_sec = 0.0
         self._num_replans = 0
         self._planning_time_total_sec = 0.0
         self._generation_time_total_sec = 0.0
@@ -307,16 +240,6 @@ class DiffusionPlannerPolicy(BasePolicy):
         goal_offset_steps: int | None = None,
         eval_budget: int | None = None,
         runtime_execute_steps: int | None = None,
-        corrective_enabled: bool = False,
-        corrective_mode: str = "none",
-        corrective_correction_interval: int = 2,
-        corrective_error_threshold: float = 0.5,
-        corrective_trigger_stat: str = "max",
-        corrective_trigger_quantile: float = 0.9,
-        corrective_trigger_scope: str = "per_env",
-        corrective_error_metric: str = "l2",
-        corrective_log_prediction_error: bool = False,
-        corrector_path: str | Path | None = None,
         refinement_enabled: bool = False,
         refinement_steps: int = 1,
         refinement_step_size: float = 0.03,
@@ -325,22 +248,12 @@ class DiffusionPlannerPolicy(BasePolicy):
         refinement_prior_weight: float = 0.05,
         refinement_smoothness_weight: float = 0.005,
         refinement_grad_clip_norm: float | None = None,
-        rerank_delta_weight: float = 0.0,
-        rerank_jerk_weight: float = 0.0,
-        rerank_action_l2_weight: float = 0.0,
-        rerank_clip_weight: float = 0.0,
         **kwargs: Any,
     ) -> "DiffusionPlannerPolicy":
         bundle = load_diffusion_planner_bundle(bundle_path, map_location=map_location)
         planner = bundle.instantiate_model(map_location=map_location)
         planner.load_state_dict(bundle.model_state_dict)
         planner.eval()
-        corrector_bundle = None
-        corrector = None
-        if corrector_path not in [None, "", "null"]:
-            corrector_bundle = load_corrector_bundle(corrector_path, map_location=map_location)
-            corrector = corrector_bundle.instantiate_model(map_location=map_location)
-            corrector.eval()
         return cls(
             world_model=world_model,
             planner=planner,
@@ -359,18 +272,6 @@ class DiffusionPlannerPolicy(BasePolicy):
             goal_offset_steps=goal_offset_steps,
             eval_budget=eval_budget,
             runtime_execute_steps=runtime_execute_steps,
-            corrective_enabled=corrective_enabled,
-            corrective_mode=corrective_mode,
-            corrective_correction_interval=corrective_correction_interval,
-            corrective_error_threshold=corrective_error_threshold,
-            corrective_trigger_stat=corrective_trigger_stat,
-            corrective_trigger_quantile=corrective_trigger_quantile,
-            corrective_trigger_scope=corrective_trigger_scope,
-            corrective_error_metric=corrective_error_metric,
-            corrective_log_prediction_error=corrective_log_prediction_error,
-            corrector=corrector,
-            corrector_bundle=corrector_bundle,
-            corrector_path=corrector_path,
             refinement_enabled=refinement_enabled,
             refinement_steps=refinement_steps,
             refinement_step_size=refinement_step_size,
@@ -379,10 +280,6 @@ class DiffusionPlannerPolicy(BasePolicy):
             refinement_prior_weight=refinement_prior_weight,
             refinement_smoothness_weight=refinement_smoothness_weight,
             refinement_grad_clip_norm=refinement_grad_clip_norm,
-            rerank_delta_weight=rerank_delta_weight,
-            rerank_jerk_weight=rerank_jerk_weight,
-            rerank_action_l2_weight=rerank_action_l2_weight,
-            rerank_clip_weight=rerank_clip_weight,
             **kwargs,
         )
 
@@ -552,16 +449,6 @@ class DiffusionPlannerPolicy(BasePolicy):
         self._current_plan_start_latent = None
         self._current_plan_index = 0
         self._current_plan_executed_steps = 0
-        self._logged_prediction_error_steps = set()
-        self._checked_prediction_error_steps = set()
-        self._prediction_error_records = []
-        self._corrective_check_count = 0
-        self._corrective_replan_count = 0
-        self._corrective_replan_error_records = []
-        self._corrective_correction_count = 0
-        self._corrective_correction_norms = []
-        self._corrective_action_delta_norms = []
-        self._corrective_correction_time_total_sec = 0.0
         self._num_replans = 0
         self._planning_time_total_sec = 0.0
         self._generation_time_total_sec = 0.0
@@ -598,8 +485,6 @@ class DiffusionPlannerPolicy(BasePolicy):
         prepared_info = self._prepare_info(dict(info_dict))
         planned_this_call = False
 
-        self._maybe_handle_corrective_checkpoint(prepared_info)
-
         if len(self._action_buffer) == 0:
             plan = self.plan_actions(prepared_info)  # [num_envs, plan_horizon, action_dim]
             self._last_plan = plan
@@ -611,8 +496,6 @@ class DiffusionPlannerPolicy(BasePolicy):
             )
             self._current_plan_index += 1
             self._current_plan_executed_steps = 0
-            self._logged_prediction_error_steps = set()
-            self._checked_prediction_error_steps = set()
             self._num_replans += 1
             self._action_buffer.extend(executed_plan.transpose(0, 1))
             planned_this_call = True
@@ -647,340 +530,6 @@ class DiffusionPlannerPolicy(BasePolicy):
             )
 
         return action
-
-    def get_prediction_error_records(self) -> list[dict[str, float | int | str]]:
-        """Return a copy of raw prediction-error checkpoint records."""
-        return [dict(record) for record in self._prediction_error_records]
-
-    def get_prediction_error_summary(
-        self,
-        episode_successes: Any,
-    ) -> dict[str, float | int]:
-        return summarize_prediction_error_records(
-            self._prediction_error_records,
-            episode_successes,
-        )
-
-    @torch.inference_mode()
-    def _maybe_log_prediction_error(
-        self,
-        prepared_info: dict[str, torch.Tensor],
-    ) -> None:
-        if not self.corrective_log_prediction_error:
-            return
-        checkpoint = self._compute_prediction_error_checkpoint(prepared_info)
-        if checkpoint is None:
-            return
-        self._record_prediction_error_checkpoint(checkpoint)
-
-    @torch.inference_mode()
-    def _maybe_handle_corrective_checkpoint(
-        self,
-        prepared_info: dict[str, torch.Tensor],
-    ) -> None:
-        checkpoint = self._compute_prediction_error_checkpoint(prepared_info)
-        if checkpoint is None:
-            return
-
-        if self.corrective_log_prediction_error:
-            self._record_prediction_error_checkpoint(checkpoint)
-
-        if self.corrective_mode not in {"replan", "learned"}:
-            return
-
-        self._corrective_check_count += 1
-        trigger_error = compute_trigger_error(
-            checkpoint.errors,
-            stat=self.corrective_trigger_stat,
-            quantile=self.corrective_trigger_quantile,
-        )
-        env_indices = self._resolve_corrective_replan_env_indices(
-            checkpoint,
-            trigger_error=trigger_error,
-        )
-        if len(env_indices) == 0:
-            return
-
-        record = {
-            "step": int(checkpoint.step),
-            "plan_index": int(checkpoint.plan_index),
-            "rollout_blocks": int(checkpoint.rollout_blocks),
-            "max_error": float(checkpoint.max_error),
-            "mean_error": float(checkpoint.mean_error),
-            "trigger_error": float(trigger_error),
-            "trigger_stat": self.corrective_trigger_stat,
-            "trigger_quantile": float(self.corrective_trigger_quantile),
-            "trigger_scope": self.corrective_trigger_scope,
-            "threshold": float(self.corrective_error_threshold),
-            "env_indices": [int(index) for index in env_indices],
-            "env_count": int(len(env_indices)),
-            "metric": self.corrective_error_metric,
-            "mode": self.corrective_mode,
-        }
-
-        if self.corrective_mode == "learned":
-            self._apply_learned_correction(checkpoint, env_indices, record=record)
-            return
-
-        self._corrective_replan_count += 1
-        self._corrective_replan_error_records.append(record)
-        if self.corrective_trigger_scope == "batch":
-            self._discard_current_plan_for_corrective_replan()
-            return
-        self._replan_selected_envs(prepared_info, env_indices)
-
-    @torch.inference_mode()
-    def _apply_learned_correction(
-        self,
-        checkpoint: PredictionErrorCheckpoint,
-        env_indices: list[int],
-        *,
-        record: dict[str, Any],
-    ) -> None:
-        if self.corrector is None:
-            raise ValueError("corrective.mode=learned requires a loaded corrector.")
-        if len(env_indices) == 0:
-            return
-        if self._current_plan is None:
-            return
-        if len(self._action_buffer) == 0:
-            return
-
-        correction_start = time.perf_counter()
-        remaining_steps = int(len(self._action_buffer))
-        if hasattr(self.corrector, "remain_horizon"):
-            expected_steps = int(getattr(self.corrector, "remain_horizon"))
-            if remaining_steps != expected_steps:
-                return
-
-        buffer_steps = list(self._action_buffer)
-        u_remain = torch.stack(
-            [step.detach().clone() for step in buffer_steps],
-            dim=1,
-        )  # [B, remaining_steps, action_dim]
-        selected_cpu = torch.as_tensor(env_indices, dtype=torch.long, device=u_remain.device)
-        selected_device = selected_cpu.to(device=checkpoint.z_real.device)
-        first_parameter = next(self.corrector.parameters(), None)
-        if first_parameter is None:
-            corrector_device = u_remain.device
-            corrector_dtype = u_remain.dtype
-        else:
-            corrector_device = first_parameter.device
-            corrector_dtype = first_parameter.dtype
-        z_real = checkpoint.z_real.index_select(0, selected_device).to(
-            device=corrector_device,
-            dtype=corrector_dtype,
-        )
-        z_goal = checkpoint.z_goal.index_select(0, selected_device).to(
-            device=corrector_device,
-            dtype=corrector_dtype,
-        )
-        error_latent = (checkpoint.z_real - checkpoint.z_pred).index_select(0, selected_device).to(
-            device=corrector_device,
-            dtype=corrector_dtype,
-        )
-        original = u_remain.index_select(0, selected_cpu)
-        corrected = self.corrector(
-            z_real,
-            z_goal,
-            error_latent,
-            original.to(device=corrector_device, dtype=corrector_dtype),
-        )
-        if tuple(corrected.shape) != tuple(original.shape):
-            raise ValueError(
-                "Corrector output shape must match selected remainder shape: "
-                f"{tuple(corrected.shape)} != {tuple(original.shape)}."
-            )
-        corrected = corrected.to(device=u_remain.device, dtype=u_remain.dtype)
-        for step_index in range(remaining_steps):
-            updated = buffer_steps[step_index].clone()
-            updated[env_indices] = corrected[:, step_index, :]
-            buffer_steps[step_index] = updated
-            plan_step = int(self._current_plan_executed_steps) + step_index
-            if plan_step < int(self._current_plan.shape[1]):
-                self._current_plan[env_indices, plan_step, :] = corrected[:, step_index, :].to(
-                    device=self._current_plan.device,
-                    dtype=self._current_plan.dtype,
-                )
-        self._action_buffer = deque(buffer_steps, maxlen=self.runtime_execute_steps)
-
-        delta = corrected - original
-        correction_norm = float(
-            torch.linalg.vector_norm(corrected.reshape(int(corrected.shape[0]), -1), ord=2, dim=-1)
-            .mean()
-            .item()
-        )
-        delta_norm = float(
-            torch.linalg.vector_norm(delta.reshape(int(delta.shape[0]), -1), ord=2, dim=-1)
-            .mean()
-            .item()
-        )
-        elapsed = time.perf_counter() - correction_start
-        self._corrective_correction_count += 1
-        self._corrective_correction_norms.append(correction_norm)
-        self._corrective_action_delta_norms.append(delta_norm)
-        self._corrective_correction_time_total_sec += float(elapsed)
-        self._corrective_replan_error_records.append(
-            {
-                **record,
-                "correction_norm": correction_norm,
-                "action_delta_norm": delta_norm,
-                "correction_time_sec": float(elapsed),
-            }
-        )
-
-    @torch.inference_mode()
-    def _maybe_trigger_corrective_replan(
-        self,
-        prepared_info: dict[str, torch.Tensor],
-    ) -> bool:
-        previous_count = int(getattr(self, "_corrective_replan_count", 0))
-        self._maybe_handle_corrective_checkpoint(prepared_info)
-        return int(getattr(self, "_corrective_replan_count", 0)) > previous_count
-
-    def _discard_current_plan_for_corrective_replan(self) -> None:
-        self._action_buffer.clear()
-        self._current_plan = None
-        self._current_plan_start_latent = None
-        self._current_plan_executed_steps = 0
-        self._logged_prediction_error_steps = set()
-        self._checked_prediction_error_steps = set()
-
-    def _resolve_corrective_replan_env_indices(
-        self,
-        checkpoint: PredictionErrorCheckpoint,
-        *,
-        trigger_error: float,
-    ) -> list[int]:
-        if self.corrective_trigger_scope == "batch":
-            if trigger_error <= self.corrective_error_threshold:
-                return []
-            return list(range(int(checkpoint.errors.numel())))
-        if self.corrective_trigger_scope != "per_env":
-            raise ValueError(
-                "corrective_trigger_scope must be one of per_env or batch, "
-                f"got '{self.corrective_trigger_scope}'."
-            )
-
-        triggered = torch.nonzero(
-            checkpoint.errors.detach().reshape(-1) > self.corrective_error_threshold,
-            as_tuple=False,
-        ).reshape(-1)
-        return [int(index) for index in triggered.detach().cpu().tolist()]
-
-    @torch.inference_mode()
-    def _replan_selected_envs(
-        self,
-        prepared_info: dict[str, torch.Tensor],
-        env_indices: list[int],
-    ) -> None:
-        if len(env_indices) == 0:
-            return
-        if self._current_plan is None:
-            return
-        if len(self._action_buffer) == 0:
-            return
-
-        replan_plan = self.plan_actions(prepared_info)
-        self._last_plan = replan_plan
-        executed_plan = replan_plan[:, : self.runtime_execute_steps, :].detach()
-        self._last_executed_plan = executed_plan
-        if self._last_plan_start_latent is not None and self._current_plan_start_latent is not None:
-            self._current_plan_start_latent[env_indices] = self._last_plan_start_latent.detach()[env_indices]
-        self._current_plan[env_indices] = replan_plan.detach()[env_indices]
-
-        remaining_steps = min(int(len(self._action_buffer)), int(executed_plan.shape[1]))
-        replacement = executed_plan[:, :remaining_steps, :].transpose(0, 1)
-        buffer_steps = list(self._action_buffer)
-        for step_index in range(remaining_steps):
-            updated = buffer_steps[step_index].clone()
-            updated[env_indices] = replacement[step_index, env_indices]
-            buffer_steps[step_index] = updated
-        self._action_buffer = deque(buffer_steps, maxlen=self.runtime_execute_steps)
-        self._num_replans += 1
-
-    @torch.inference_mode()
-    def _compute_prediction_error_checkpoint(
-        self,
-        prepared_info: dict[str, torch.Tensor],
-    ) -> PredictionErrorCheckpoint | None:
-        if not self.corrective_enabled:
-            return None
-        if self.corrective_mode not in {"none", "replan", "learned"}:
-            raise ValueError(
-                "corrective_mode must be one of none, replan, learned, "
-                f"got '{self.corrective_mode}'."
-            )
-        if self._current_plan is None or self._current_plan_start_latent is None:
-            return None
-
-        rollout_blocks = resolve_prediction_error_check(
-            prefix_steps=self._current_plan_executed_steps,
-            action_block=self.action_block,
-            correction_interval=self.corrective_correction_interval,
-        )
-        if rollout_blocks is None:
-            return None
-        if self._current_plan_executed_steps in self._checked_prediction_error_steps:
-            return None
-
-        z_real, z_goal = self.encode_current_goal(prepared_info)
-        prefix = self._current_plan[
-            :,
-            : self._current_plan_executed_steps,
-            :,
-        ].to(device=z_real.device, dtype=z_real.dtype)
-        action_blocks = prefix.reshape(
-            int(prefix.shape[0]),
-            int(rollout_blocks),
-            self.blocked_action_dim,
-        )
-        rollout = latent_rollout(
-            world_model=self.world_model,
-            z_context=self._current_plan_start_latent.to(
-                device=z_real.device,
-                dtype=z_real.dtype,
-            ),
-            action_blocks=action_blocks,
-            history_size=int(prepared_info["pixels"].shape[1]),
-            return_sequence=False,
-            freeze_world_model=True,
-        )
-        errors = compute_prediction_error(
-            z_real,
-            rollout["z_terminal"],
-            metric=self.corrective_error_metric,
-        )
-        detached_errors = errors.detach()
-        self._checked_prediction_error_steps.add(int(self._current_plan_executed_steps))
-        return PredictionErrorCheckpoint(
-            step=int(self._current_plan_executed_steps),
-            plan_index=int(self._current_plan_index),
-            rollout_blocks=int(rollout_blocks),
-            z_real=z_real.detach(),
-            z_pred=rollout["z_terminal"].detach(),
-            z_goal=z_goal.detach(),
-            errors=detached_errors,
-            max_error=float(torch.max(detached_errors).item()),
-            mean_error=float(torch.mean(detached_errors).item()),
-        )
-
-    def _record_prediction_error_checkpoint(
-        self,
-        checkpoint: PredictionErrorCheckpoint,
-    ) -> None:
-        for env_index, value in enumerate(checkpoint.errors.detach().cpu().tolist()):
-            self._prediction_error_records.append(
-                {
-                    "env_index": int(env_index),
-                    "step": int(checkpoint.step),
-                    "plan_index": int(checkpoint.plan_index),
-                    "rollout_blocks": int(checkpoint.rollout_blocks),
-                    "error": float(value),
-                    "metric": self.corrective_error_metric,
-                }
-            )
-        self._logged_prediction_error_steps.add(int(checkpoint.step))
 
     @torch.inference_mode()
     def plan_actions(self, prepared_info: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -1195,45 +744,6 @@ class DiffusionPlannerPolicy(BasePolicy):
             return torch.zeros((), device=candidates.device, dtype=candidates.dtype)
         diffs = candidate_steps[:, :, 1:, :] - candidate_steps[:, :, :-1, :]
         return diffs.square().mean()
-
-    def compute_rerank_penalty(self, candidates: torch.Tensor) -> torch.Tensor:
-        """Return per-candidate action quality penalty for reranking.
-
-        candidates: [B, K, action_chunk_dim]
-        returns: [B, K]
-        """
-        if candidates.ndim != 3:
-            raise ValueError(f"candidates must have shape [B, K, D], got {tuple(candidates.shape)}.")
-        candidate_steps = candidates.reshape(
-            int(candidates.shape[0]),
-            int(candidates.shape[1]),
-            self.plan_horizon,
-            self.action_dim,
-        )
-        penalty = torch.zeros(
-            int(candidates.shape[0]),
-            int(candidates.shape[1]),
-            dtype=candidates.dtype,
-            device=candidates.device,
-        )
-        if self.rerank_action_l2_weight > 0.0:
-            penalty = penalty + float(self.rerank_action_l2_weight) * candidate_steps.square().mean(dim=(2, 3))
-        if self.rerank_delta_weight > 0.0 and int(candidate_steps.shape[2]) > 1:
-            delta = candidate_steps[:, :, 1:, :] - candidate_steps[:, :, :-1, :]
-            penalty = penalty + float(self.rerank_delta_weight) * delta.square().mean(dim=(2, 3))
-        if self.rerank_jerk_weight > 0.0 and int(candidate_steps.shape[2]) > 2:
-            jerk = candidate_steps[:, :, 2:, :] - 2.0 * candidate_steps[:, :, 1:-1, :] + candidate_steps[:, :, :-2, :]
-            penalty = penalty + float(self.rerank_jerk_weight) * jerk.square().mean(dim=(2, 3))
-        if self.rerank_clip_weight > 0.0 and self._action_low is not None and self._action_high is not None:
-            low = torch.as_tensor(self._action_low, dtype=candidates.dtype, device=candidates.device)
-            high = torch.as_tensor(self._action_high, dtype=candidates.dtype, device=candidates.device)
-            low = low.reshape(-1)[-self.action_dim :].view(1, 1, 1, self.action_dim)
-            high = high.reshape(-1)[-self.action_dim :].view(1, 1, 1, self.action_dim)
-            lower_excess = torch.clamp(low - candidate_steps, min=0.0)
-            upper_excess = torch.clamp(candidate_steps - high, min=0.0)
-            clip_excess = lower_excess.square() + upper_excess.square()
-            penalty = penalty + float(self.rerank_clip_weight) * clip_excess.mean(dim=(2, 3))
-        return penalty
 
     def _refinement_cost(
         self,
@@ -1865,17 +1375,10 @@ class DiffusionPlannerPolicy(BasePolicy):
 
         finite_mask = torch.isfinite(world_model_costs)  # [B, K]
         has_finite = finite_mask.any(dim=-1)  # [B]
-        rerank_penalty = self.compute_rerank_penalty(candidates)
-        penalized_world_model_costs = world_model_costs + rerank_penalty
-        penalized_world_model_costs = torch.where(
-            torch.isfinite(world_model_costs),
-            penalized_world_model_costs,
-            world_model_costs,
-        )
         safe_costs = torch.where(
             finite_mask,
-            penalized_world_model_costs,
-            torch.full_like(penalized_world_model_costs, float("inf")),
+            world_model_costs,
+            torch.full_like(world_model_costs, float("inf")),
         )  # [B, K]
 
         best_by_cost = torch.argmin(safe_costs, dim=-1)  # [B]
@@ -1887,7 +1390,7 @@ class DiffusionPlannerPolicy(BasePolicy):
             selected_indices = best_by_score  # [B]
             fallback_to_model_score = torch.ones_like(best_by_score, dtype=torch.bool)  # [B]
         elif self.selection_mode == "hybrid":
-            hybrid_values = self.compute_hybrid_selection_values(penalized_world_model_costs, model_scores)  # [B, K]
+            hybrid_values = self.compute_hybrid_selection_values(world_model_costs, model_scores)  # [B, K]
             best_by_hybrid = torch.argmax(hybrid_values, dim=-1)  # [B]
             selected_indices = torch.where(has_finite, best_by_hybrid, best_by_score)  # [B]
             fallback_to_model_score = ~has_finite  # [B]
@@ -2153,44 +1656,4 @@ class DiffusionPlannerPolicy(BasePolicy):
             raise ValueError(
                 "refinement_grad_clip_norm must be positive when set, "
                 f"got {self.refinement_grad_clip_norm}."
-            )
-        if self.rerank_delta_weight < 0.0:
-            raise ValueError(f"rerank_delta_weight must be non-negative, got {self.rerank_delta_weight}.")
-        if self.rerank_jerk_weight < 0.0:
-            raise ValueError(f"rerank_jerk_weight must be non-negative, got {self.rerank_jerk_weight}.")
-        if self.rerank_action_l2_weight < 0.0:
-            raise ValueError(
-                f"rerank_action_l2_weight must be non-negative, got {self.rerank_action_l2_weight}."
-            )
-        if self.rerank_clip_weight < 0.0:
-            raise ValueError(f"rerank_clip_weight must be non-negative, got {self.rerank_clip_weight}.")
-        self._validate_learned_corrector_contract()
-
-    def _expected_corrector_remain_horizon(self) -> int:
-        effective_correction_steps = int(
-            math.ceil(self.corrective_correction_interval / self.action_block)
-            * self.action_block
-        )
-        return int(self.runtime_execute_steps - effective_correction_steps)
-
-    def _validate_learned_corrector_contract(self) -> None:
-        if not self.corrective_enabled or self.corrective_mode != "learned":
-            return
-        if self.corrector is None:
-            raise ValueError("corrective.mode=learned requires a loaded corrector.")
-        if not hasattr(self.corrector, "remain_horizon"):
-            raise ValueError("Loaded corrector must expose remain_horizon.")
-        expected = self._expected_corrector_remain_horizon()
-        if expected <= 0:
-            raise ValueError(
-                "corrective.mode=learned requires runtime_execute_steps to exceed "
-                f"the effective correction checkpoint, got expected remain_horizon={expected}."
-            )
-        actual = int(getattr(self.corrector, "remain_horizon"))
-        if actual != expected:
-            raise ValueError(
-                "Corrector remain_horizon does not match eval corrective horizon: "
-                f"{actual} != {expected}. "
-                "Train the corrector with the same correction_interval/action_block "
-                "and use matching corrective.execute_horizon."
             )
