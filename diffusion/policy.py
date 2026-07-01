@@ -137,6 +137,7 @@ class DiffusionPlannerPolicy(BasePolicy):
         noise_scale: float = 1.0,
         sampling_temperature: float = 1.0,
         selection_mode: str = "wm_only",
+        score_topk: int | None = None,
         goal_offset_steps: int | None = None,
         eval_budget: int | None = None,
         runtime_execute_steps: int | None = None,
@@ -160,6 +161,10 @@ class DiffusionPlannerPolicy(BasePolicy):
         refinement_prior_weight: float = 0.05,
         refinement_smoothness_weight: float = 0.005,
         refinement_grad_clip_norm: float | None = None,
+        rerank_delta_weight: float = 0.0,
+        rerank_jerk_weight: float = 0.0,
+        rerank_action_l2_weight: float = 0.0,
+        rerank_clip_weight: float = 0.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -184,6 +189,7 @@ class DiffusionPlannerPolicy(BasePolicy):
         self.proposal_noise_scale = float(noise_scale)
         self.proposal_sampling_temperature = float(sampling_temperature)
         self.selection_mode = str(selection_mode).lower().strip()
+        self.score_topk = None if score_topk is None else int(score_topk)
         self.requested_goal_offset_steps = None if goal_offset_steps is None else int(goal_offset_steps)
         self.requested_eval_budget = None if eval_budget is None else int(eval_budget)
         self.requested_runtime_execute_steps = (
@@ -211,6 +217,10 @@ class DiffusionPlannerPolicy(BasePolicy):
         self.refinement_grad_clip_norm = (
             None if refinement_grad_clip_norm is None else float(refinement_grad_clip_norm)
         )
+        self.rerank_delta_weight = float(rerank_delta_weight)
+        self.rerank_jerk_weight = float(rerank_jerk_weight)
+        self.rerank_action_l2_weight = float(rerank_action_l2_weight)
+        self.rerank_clip_weight = float(rerank_clip_weight)
         self.runtime_spec = self._resolve_runtime_spec(config=config)
 
         self._action_buffer: deque[torch.Tensor] = deque(maxlen=self.runtime_execute_steps)
@@ -258,6 +268,17 @@ class DiffusionPlannerPolicy(BasePolicy):
         self._scoring_time_total_sec = 0.0
         self._selection_time_total_sec = 0.0
         self._refinement_time_total_sec = 0.0
+        self._wm_scoring_time_total_sec = 0.0
+        self._wm_rollout_time_total_sec = 0.0
+        self._wm_goal_encode_time_total_sec = 0.0
+        self._wm_criterion_time_total_sec = 0.0
+        self._wm_scoring_call_count = 0
+        self._wm_rollout_candidate_count = 0
+        self._wm_rollout_block_count = 0
+        self._wm_refinement_rollout_time_total_sec = 0.0
+        self._wm_refinement_rollout_call_count = 0
+        self._wm_refinement_rollout_candidate_count = 0
+        self._wm_refinement_rollout_block_count = 0
         self._env_action_shape: tuple[int, ...] | None = None
         self._action_low: np.ndarray | None = None
         self._action_high: np.ndarray | None = None
@@ -282,6 +303,7 @@ class DiffusionPlannerPolicy(BasePolicy):
         noise_scale: float = 1.0,
         sampling_temperature: float = 1.0,
         selection_mode: str = "wm_only",
+        score_topk: int | None = None,
         goal_offset_steps: int | None = None,
         eval_budget: int | None = None,
         runtime_execute_steps: int | None = None,
@@ -303,6 +325,10 @@ class DiffusionPlannerPolicy(BasePolicy):
         refinement_prior_weight: float = 0.05,
         refinement_smoothness_weight: float = 0.005,
         refinement_grad_clip_norm: float | None = None,
+        rerank_delta_weight: float = 0.0,
+        rerank_jerk_weight: float = 0.0,
+        rerank_action_l2_weight: float = 0.0,
+        rerank_clip_weight: float = 0.0,
         **kwargs: Any,
     ) -> "DiffusionPlannerPolicy":
         bundle = load_diffusion_planner_bundle(bundle_path, map_location=map_location)
@@ -329,6 +355,7 @@ class DiffusionPlannerPolicy(BasePolicy):
             noise_scale=noise_scale,
             sampling_temperature=sampling_temperature,
             selection_mode=selection_mode,
+            score_topk=score_topk,
             goal_offset_steps=goal_offset_steps,
             eval_budget=eval_budget,
             runtime_execute_steps=runtime_execute_steps,
@@ -352,6 +379,10 @@ class DiffusionPlannerPolicy(BasePolicy):
             refinement_prior_weight=refinement_prior_weight,
             refinement_smoothness_weight=refinement_smoothness_weight,
             refinement_grad_clip_norm=refinement_grad_clip_norm,
+            rerank_delta_weight=rerank_delta_weight,
+            rerank_jerk_weight=rerank_jerk_weight,
+            rerank_action_l2_weight=rerank_action_l2_weight,
+            rerank_clip_weight=rerank_clip_weight,
             **kwargs,
         )
 
@@ -503,6 +534,9 @@ class DiffusionPlannerPolicy(BasePolicy):
         self._last_fallback_to_model_score = None
         self._last_initial_noisy_candidates = None
         self._last_final_noisy_state = None
+        self._last_score_topk_indices = None
+        self._last_score_topk_world_model_costs = None
+        self._last_score_topk_model_scores = None
         self._last_unrefined_candidates = None
         self._last_refined_candidates = None
         self._last_refinement_cost_before = None
@@ -534,6 +568,26 @@ class DiffusionPlannerPolicy(BasePolicy):
         self._scoring_time_total_sec = 0.0
         self._selection_time_total_sec = 0.0
         self._refinement_time_total_sec = 0.0
+        self._wm_scoring_time_total_sec = 0.0
+        self._wm_rollout_time_total_sec = 0.0
+        self._wm_goal_encode_time_total_sec = 0.0
+        self._wm_criterion_time_total_sec = 0.0
+        self._wm_scoring_call_count = 0
+        self._wm_rollout_candidate_count = 0
+        self._wm_rollout_block_count = 0
+        self._wm_refinement_rollout_time_total_sec = 0.0
+        self._wm_refinement_rollout_call_count = 0
+        self._wm_refinement_rollout_candidate_count = 0
+        self._wm_refinement_rollout_block_count = 0
+
+    @staticmethod
+    def _sync_cuda_if_available() -> None:
+        if not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            pass
 
     def get_action(self, info_dict: dict[str, Any], **kwargs: Any) -> np.ndarray:
         """Return one environment-step action for each env."""
@@ -941,36 +995,67 @@ class DiffusionPlannerPolicy(BasePolicy):
         generation_time = time.perf_counter() - generation_start
         candidates = generation["candidates"]  # [B, K, action_chunk_dim]
         model_scores = generation["score_logits"]  # [B, K]
+
         scoring_start = time.perf_counter()
-        initial_world_model_costs = self.score_candidates_with_world_model(
-            prepared_info,
-            candidates,
-        )  # [B, K]
-        scoring_time = time.perf_counter() - scoring_start
-        refinement_start = time.perf_counter()
-        refined_candidates = self.refine_candidates_with_world_model(
-            prepared_info,
-            candidates,
-            world_model_costs=initial_world_model_costs,
-            model_scores=model_scores,
-        )
-        refinement_time = time.perf_counter() - refinement_start
-        if refined_candidates is candidates or torch.equal(refined_candidates, candidates):
-            world_model_costs = initial_world_model_costs
+        if self.selection_mode == "score_topk_wm":
+            refined_candidates = candidates
+            topk_candidates, topk_scores, topk_world_model_costs, topk_indices = (
+                self.score_prefilter_candidates_with_world_model(
+                    prepared_info,
+                    candidates,
+                    model_scores,
+                )
+            )
+            world_model_costs = self._expand_score_topk_costs(
+                model_scores=model_scores,
+                topk_indices=topk_indices,
+                topk_world_model_costs=topk_world_model_costs,
+            )
+            refinement_time = 0.0
+            scoring_time = time.perf_counter() - scoring_start
+
+            selection_start = time.perf_counter()
+            topk_selected, topk_selected_indices, fallback_mask = self.select_best_candidates(
+                topk_candidates,
+                topk_world_model_costs,
+                topk_scores,
+            )
+            selected_indices = topk_indices.gather(1, topk_selected_indices.view(-1, 1)).squeeze(1)
+            selected_candidates = topk_selected
+            selection_time = time.perf_counter() - selection_start
         else:
-            rescoring_start = time.perf_counter()
-            world_model_costs = self.score_candidates_with_world_model(
+            initial_world_model_costs = self.score_candidates_with_world_model(
                 prepared_info,
-                refined_candidates,
+                candidates,
             )  # [B, K]
-            scoring_time += time.perf_counter() - rescoring_start
-        selection_start = time.perf_counter()
-        selected_candidates, selected_indices, fallback_mask = self.select_best_candidates(
-            refined_candidates,
-            world_model_costs,
-            model_scores,
-        )  # [B, action_chunk_dim], [B], [B]
-        selection_time = time.perf_counter() - selection_start
+            scoring_time = time.perf_counter() - scoring_start
+
+            refinement_start = time.perf_counter()
+            refined_candidates = self.refine_candidates_with_world_model(
+                prepared_info,
+                candidates,
+                world_model_costs=initial_world_model_costs,
+                model_scores=model_scores,
+            )
+            refinement_time = time.perf_counter() - refinement_start
+            if refined_candidates is candidates or torch.equal(refined_candidates, candidates):
+                world_model_costs = initial_world_model_costs
+            else:
+                rescoring_start = time.perf_counter()
+                world_model_costs = self.score_candidates_with_world_model(
+                    prepared_info,
+                    refined_candidates,
+                )  # [B, K]
+                scoring_time += time.perf_counter() - rescoring_start
+
+            selection_start = time.perf_counter()
+            selected_candidates, selected_indices, fallback_mask = self.select_best_candidates(
+                refined_candidates,
+                world_model_costs,
+                model_scores,
+            )  # [B, action_chunk_dim], [B], [B]
+            selection_time = time.perf_counter() - selection_start
+
         selected_wm_costs = world_model_costs.gather(1, selected_indices.view(-1, 1)).squeeze(1)  # [B]
         selected_model_scores = model_scores.gather(1, selected_indices.view(-1, 1)).squeeze(1)  # [B]
         finite_mask = torch.isfinite(world_model_costs)  # [B, K]
@@ -1111,6 +1196,45 @@ class DiffusionPlannerPolicy(BasePolicy):
         diffs = candidate_steps[:, :, 1:, :] - candidate_steps[:, :, :-1, :]
         return diffs.square().mean()
 
+    def compute_rerank_penalty(self, candidates: torch.Tensor) -> torch.Tensor:
+        """Return per-candidate action quality penalty for reranking.
+
+        candidates: [B, K, action_chunk_dim]
+        returns: [B, K]
+        """
+        if candidates.ndim != 3:
+            raise ValueError(f"candidates must have shape [B, K, D], got {tuple(candidates.shape)}.")
+        candidate_steps = candidates.reshape(
+            int(candidates.shape[0]),
+            int(candidates.shape[1]),
+            self.plan_horizon,
+            self.action_dim,
+        )
+        penalty = torch.zeros(
+            int(candidates.shape[0]),
+            int(candidates.shape[1]),
+            dtype=candidates.dtype,
+            device=candidates.device,
+        )
+        if self.rerank_action_l2_weight > 0.0:
+            penalty = penalty + float(self.rerank_action_l2_weight) * candidate_steps.square().mean(dim=(2, 3))
+        if self.rerank_delta_weight > 0.0 and int(candidate_steps.shape[2]) > 1:
+            delta = candidate_steps[:, :, 1:, :] - candidate_steps[:, :, :-1, :]
+            penalty = penalty + float(self.rerank_delta_weight) * delta.square().mean(dim=(2, 3))
+        if self.rerank_jerk_weight > 0.0 and int(candidate_steps.shape[2]) > 2:
+            jerk = candidate_steps[:, :, 2:, :] - 2.0 * candidate_steps[:, :, 1:-1, :] + candidate_steps[:, :, :-2, :]
+            penalty = penalty + float(self.rerank_jerk_weight) * jerk.square().mean(dim=(2, 3))
+        if self.rerank_clip_weight > 0.0 and self._action_low is not None and self._action_high is not None:
+            low = torch.as_tensor(self._action_low, dtype=candidates.dtype, device=candidates.device)
+            high = torch.as_tensor(self._action_high, dtype=candidates.dtype, device=candidates.device)
+            low = low.reshape(-1)[-self.action_dim :].view(1, 1, 1, self.action_dim)
+            high = high.reshape(-1)[-self.action_dim :].view(1, 1, 1, self.action_dim)
+            lower_excess = torch.clamp(low - candidate_steps, min=0.0)
+            upper_excess = torch.clamp(candidate_steps - high, min=0.0)
+            clip_excess = lower_excess.square() + upper_excess.square()
+            penalty = penalty + float(self.rerank_clip_weight) * clip_excess.mean(dim=(2, 3))
+        return penalty
+
     def _refinement_cost(
         self,
         *,
@@ -1121,14 +1245,27 @@ class DiffusionPlannerPolicy(BasePolicy):
         history_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         action_blocks = self.flatten_candidates_to_action_blocks(candidates)
-        rollout = latent_rollout(
-            world_model=self.world_model,
-            z_context=z_cur,
-            action_blocks=action_blocks,
-            history_size=history_size,
-            return_sequence=False,
-            freeze_world_model=True,
-        )
+        self._sync_cuda_if_available()
+        rollout_start = time.perf_counter()
+        try:
+            rollout = latent_rollout(
+                world_model=self.world_model,
+                z_context=z_cur,
+                action_blocks=action_blocks,
+                history_size=history_size,
+                return_sequence=False,
+                freeze_world_model=True,
+            )
+        finally:
+            self._sync_cuda_if_available()
+            self._wm_refinement_rollout_time_total_sec += time.perf_counter() - rollout_start
+            self._wm_refinement_rollout_call_count += 1
+            self._wm_refinement_rollout_candidate_count += int(action_blocks.shape[0]) * int(action_blocks.shape[1])
+            self._wm_refinement_rollout_block_count += (
+                int(action_blocks.shape[0])
+                * int(action_blocks.shape[1])
+                * int(action_blocks.shape[2])
+            )
         z_terminal = rollout["z_terminal"]
         if z_terminal.ndim != 3:
             raise ValueError(
@@ -1307,16 +1444,29 @@ class DiffusionPlannerPolicy(BasePolicy):
             candidate_blocks: [B, K, receding_horizon, action_block * action_dim]
             world_model.get_cost(...) -> [B, K]
         """
+        self._sync_cuda_if_available()
+        scoring_start = time.perf_counter()
         scoring_info = self.prepare_info_for_scoring(prepared_info)
         candidate_blocks = self.flatten_candidates_to_action_blocks(candidates)  # [B, K, R, block_action_dim]
         expanded_info = self.expand_prepared_info_for_candidates(
             scoring_info,
             num_candidates=int(candidates.shape[1]),
         )
-        world_model_costs = self.compute_world_model_costs_from_rollout(
-            expanded_info=expanded_info,
-            candidate_blocks=candidate_blocks,
-        )
+        try:
+            world_model_costs = self.compute_world_model_costs_from_rollout(
+                expanded_info=expanded_info,
+                candidate_blocks=candidate_blocks,
+            )
+        finally:
+            self._sync_cuda_if_available()
+            self._wm_scoring_time_total_sec += time.perf_counter() - scoring_start
+            self._wm_scoring_call_count += 1
+            self._wm_rollout_candidate_count += int(candidate_blocks.shape[0]) * int(candidate_blocks.shape[1])
+            self._wm_rollout_block_count += (
+                int(candidate_blocks.shape[0])
+                * int(candidate_blocks.shape[1])
+                * int(candidate_blocks.shape[2])
+            )
         if not torch.is_tensor(world_model_costs):
             raise TypeError(
                 "World-model reranking must return a torch.Tensor, "
@@ -1355,7 +1505,12 @@ class DiffusionPlannerPolicy(BasePolicy):
                     "world_model must expose either rollout(...)+criterion(...) "
                     "or get_cost(...) for diffusion reranking."
                 )
-            return self.world_model.get_cost(clone_info_dict(expanded_info), candidate_blocks)
+            self._sync_cuda_if_available()
+            rollout_start = time.perf_counter()
+            costs = self.world_model.get_cost(clone_info_dict(expanded_info), candidate_blocks)
+            self._sync_cuda_if_available()
+            self._wm_rollout_time_total_sec += time.perf_counter() - rollout_start
+            return costs
 
         device = next(self.world_model.parameters()).device
         rollout_info = clone_info_dict(expanded_info)
@@ -1378,7 +1533,11 @@ class DiffusionPlannerPolicy(BasePolicy):
                 goal_info[key[len("goal_") :]] = goal_info.pop(key)
 
         goal_info.pop("action", None)
+        self._sync_cuda_if_available()
+        goal_encode_start = time.perf_counter()
         encoded_goal = self.world_model.encode(goal_info)
+        self._sync_cuda_if_available()
+        self._wm_goal_encode_time_total_sec += time.perf_counter() - goal_encode_start
         if "emb" not in encoded_goal:
             raise KeyError("world_model.encode(goal_info) must return a dict containing 'emb'.")
 
@@ -1397,10 +1556,19 @@ class DiffusionPlannerPolicy(BasePolicy):
         )  # [B, K, history, latent_dim]
 
         rollout_info["goal_emb"] = goal_emb
+        self._sync_cuda_if_available()
+        rollout_start = time.perf_counter()
         rollout_outputs = self.world_model.rollout(rollout_info, candidate_blocks)
+        self._sync_cuda_if_available()
+        self._wm_rollout_time_total_sec += time.perf_counter() - rollout_start
         if "predicted_emb" not in rollout_outputs:
             raise KeyError("world_model.rollout(...) must return a dict containing 'predicted_emb'.")
-        return self.world_model.criterion(rollout_outputs)
+        self._sync_cuda_if_available()
+        criterion_start = time.perf_counter()
+        costs = self.world_model.criterion(rollout_outputs)
+        self._sync_cuda_if_available()
+        self._wm_criterion_time_total_sec += time.perf_counter() - criterion_start
+        return costs
 
     @torch.inference_mode()
     def encode_current_goal(
@@ -1584,6 +1752,91 @@ class DiffusionPlannerPolicy(BasePolicy):
             torch.full_like(hybrid_values, float("-inf")),
         )  # [B, K]
 
+    def _resolve_score_topk(self, num_candidates: int) -> int:
+        if self.score_topk is None:
+            return min(16, int(num_candidates))
+        return min(int(self.score_topk), int(num_candidates))
+
+    def score_prefilter_candidates_with_world_model(
+        self,
+        prepared_info: dict[str, torch.Tensor],
+        candidates: torch.Tensor,
+        model_scores: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Score only the score-head top-k candidates with the world model.
+
+        returns:
+            topk_candidates: [B, topk, action_chunk_dim]
+            topk_scores: [B, topk]
+            topk_world_model_costs: [B, topk]
+            topk_indices: [B, topk], original candidate indices
+        """
+        if candidates.ndim != 3:
+            raise ValueError(f"candidates must have shape [B, K, D], got {tuple(candidates.shape)}.")
+        if model_scores.ndim != 2:
+            raise ValueError(f"model_scores must have shape [B, K], got {tuple(model_scores.shape)}.")
+        if tuple(candidates.shape[:2]) != tuple(model_scores.shape):
+            raise ValueError(
+                f"candidates leading dims {tuple(candidates.shape[:2])} do not match model_scores {tuple(model_scores.shape)}."
+            )
+        topk = self._resolve_score_topk(int(candidates.shape[1]))
+        if topk <= 0:
+            raise ValueError(f"score_topk must be positive when using score_topk_wm, got {topk}.")
+
+        topk_indices = torch.topk(model_scores, k=topk, dim=-1, largest=True).indices  # [B, topk]
+        gather_index = topk_indices.unsqueeze(-1).expand(-1, -1, int(candidates.shape[-1]))
+        topk_candidates = candidates.gather(1, gather_index)  # [B, topk, D]
+        topk_scores = model_scores.gather(1, topk_indices)  # [B, topk]
+        topk_world_model_costs = self.score_candidates_with_world_model(
+            prepared_info,
+            topk_candidates,
+        )  # [B, topk]
+
+        self._last_score_topk_indices = topk_indices.detach().cpu().long()
+        self._last_score_topk_world_model_costs = topk_world_model_costs.detach().cpu().float()
+        self._last_score_topk_model_scores = topk_scores.detach().cpu().float()
+        return topk_candidates, topk_scores, topk_world_model_costs, topk_indices
+
+    def _expand_score_topk_costs(
+        self,
+        *,
+        model_scores: torch.Tensor,
+        topk_indices: torch.Tensor | None,
+        topk_world_model_costs: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if topk_indices is None or topk_world_model_costs is None:
+            raise ValueError("score_topk_wm requires topk indices and topk world-model costs.")
+        topk_indices = topk_indices.to(device=model_scores.device)
+        topk_world_model_costs = topk_world_model_costs.to(device=model_scores.device, dtype=model_scores.dtype)
+        full_costs = torch.full_like(model_scores, float("inf"))
+        full_costs.scatter_(1, topk_indices, topk_world_model_costs)
+        return full_costs
+
+    def score_and_select_candidates(
+        self,
+        prepared_info: dict[str, torch.Tensor],
+        candidates: torch.Tensor,
+        model_scores: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.selection_mode != "score_topk_wm":
+            world_model_costs = self.score_candidates_with_world_model(prepared_info, candidates)
+            return self.select_best_candidates(candidates, world_model_costs, model_scores)
+
+        topk_candidates, topk_scores, topk_world_model_costs, topk_indices = (
+            self.score_prefilter_candidates_with_world_model(
+                prepared_info,
+                candidates,
+                model_scores,
+            )
+        )
+        selected_topk, selected_topk_indices, fallback_mask = self.select_best_candidates(
+            topk_candidates,
+            topk_world_model_costs,
+            topk_scores,
+        )
+        selected_indices = topk_indices.gather(1, selected_topk_indices.view(-1, 1)).squeeze(1)
+        return selected_topk, selected_indices, fallback_mask
+
     def select_best_candidates(
         self,
         candidates: torch.Tensor,
@@ -1612,22 +1865,29 @@ class DiffusionPlannerPolicy(BasePolicy):
 
         finite_mask = torch.isfinite(world_model_costs)  # [B, K]
         has_finite = finite_mask.any(dim=-1)  # [B]
+        rerank_penalty = self.compute_rerank_penalty(candidates)
+        penalized_world_model_costs = world_model_costs + rerank_penalty
+        penalized_world_model_costs = torch.where(
+            torch.isfinite(world_model_costs),
+            penalized_world_model_costs,
+            world_model_costs,
+        )
         safe_costs = torch.where(
             finite_mask,
-            world_model_costs,
-            torch.full_like(world_model_costs, float("inf")),
+            penalized_world_model_costs,
+            torch.full_like(penalized_world_model_costs, float("inf")),
         )  # [B, K]
 
         best_by_cost = torch.argmin(safe_costs, dim=-1)  # [B]
         best_by_score = torch.argmax(model_scores, dim=-1)  # [B]
-        if self.selection_mode == "wm_only":
+        if self.selection_mode in {"wm_only", "score_topk_wm"}:
             selected_indices = torch.where(has_finite, best_by_cost, torch.zeros_like(best_by_cost))  # [B]
             fallback_to_model_score = torch.zeros_like(best_by_cost, dtype=torch.bool)  # [B]
         elif self.selection_mode == "score_only":
             selected_indices = best_by_score  # [B]
             fallback_to_model_score = torch.ones_like(best_by_score, dtype=torch.bool)  # [B]
         elif self.selection_mode == "hybrid":
-            hybrid_values = self.compute_hybrid_selection_values(world_model_costs, model_scores)  # [B, K]
+            hybrid_values = self.compute_hybrid_selection_values(penalized_world_model_costs, model_scores)  # [B, K]
             best_by_hybrid = torch.argmax(hybrid_values, dim=-1)  # [B]
             selected_indices = torch.where(has_finite, best_by_hybrid, best_by_score)  # [B]
             fallback_to_model_score = ~has_finite  # [B]
@@ -1853,11 +2113,19 @@ class DiffusionPlannerPolicy(BasePolicy):
             raise ValueError(
                 f"runtime truncation_steps must be positive, got {self.runtime_truncation_steps}."
             )
-        if self.selection_mode not in {"wm_only", "hybrid", "score_only"}:
+        if self.selection_mode not in {"wm_only", "hybrid", "score_only", "score_topk_wm"}:
             raise ValueError(
-                "selection_mode must be one of {'wm_only', 'hybrid', 'score_only'}, "
+                "selection_mode must be one of {'wm_only', 'hybrid', 'score_only', 'score_topk_wm'}, "
                 f"got '{self.selection_mode}'."
             )
+        if self.score_topk is not None:
+            if self.score_topk <= 0:
+                raise ValueError(f"score_topk must be positive when set, got {self.score_topk}.")
+            if self.score_topk > self.effective_num_candidates:
+                raise ValueError(
+                    "score_topk cannot exceed effective_num_candidates: "
+                    f"{self.score_topk} > {self.effective_num_candidates}."
+                )
         if self.refinement_steps < 0:
             raise ValueError(f"refinement_steps must be non-negative, got {self.refinement_steps}.")
         if self.refinement_step_size < 0.0:
@@ -1886,6 +2154,16 @@ class DiffusionPlannerPolicy(BasePolicy):
                 "refinement_grad_clip_norm must be positive when set, "
                 f"got {self.refinement_grad_clip_norm}."
             )
+        if self.rerank_delta_weight < 0.0:
+            raise ValueError(f"rerank_delta_weight must be non-negative, got {self.rerank_delta_weight}.")
+        if self.rerank_jerk_weight < 0.0:
+            raise ValueError(f"rerank_jerk_weight must be non-negative, got {self.rerank_jerk_weight}.")
+        if self.rerank_action_l2_weight < 0.0:
+            raise ValueError(
+                f"rerank_action_l2_weight must be non-negative, got {self.rerank_action_l2_weight}."
+            )
+        if self.rerank_clip_weight < 0.0:
+            raise ValueError(f"rerank_clip_weight must be non-negative, got {self.rerank_clip_weight}.")
         self._validate_learned_corrector_contract()
 
     def _expected_corrector_remain_horizon(self) -> int:

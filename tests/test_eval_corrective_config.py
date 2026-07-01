@@ -4,6 +4,7 @@ from omegaconf import OmegaConf
 
 from eval import resolve_corrective_config
 from eval import resolve_diffusion_refinement_config
+from eval import resolve_diffusion_rerank_penalty_config
 from eval import resolve_diffusion_runtime_execute_steps
 
 
@@ -158,6 +159,37 @@ class EvalDiffusionRefinementConfigTest(unittest.TestCase):
         self.assertAlmostEqual(refinement["prior_weight"], 0.05)
         self.assertAlmostEqual(refinement["smoothness_weight"], 0.005)
         self.assertAlmostEqual(refinement["grad_clip_norm"], 0.25)
+
+
+class EvalDiffusionRerankPenaltyConfigTest(unittest.TestCase):
+    def test_missing_rerank_penalty_defaults_to_zero(self):
+        cfg = OmegaConf.create({})
+
+        penalty = resolve_diffusion_rerank_penalty_config(cfg)
+
+        self.assertAlmostEqual(penalty["delta_weight"], 0.0)
+        self.assertAlmostEqual(penalty["jerk_weight"], 0.0)
+        self.assertAlmostEqual(penalty["action_l2_weight"], 0.0)
+        self.assertAlmostEqual(penalty["clip_weight"], 0.0)
+
+    def test_resolves_rerank_penalty_config(self):
+        cfg = OmegaConf.create(
+            {
+                "diffusion_rerank_penalty": {
+                    "delta_weight": 0.25,
+                    "jerk_weight": 0.5,
+                    "action_l2_weight": 0.1,
+                    "clip_weight": 2.0,
+                }
+            }
+        )
+
+        penalty = resolve_diffusion_rerank_penalty_config(cfg)
+
+        self.assertAlmostEqual(penalty["delta_weight"], 0.25)
+        self.assertAlmostEqual(penalty["jerk_weight"], 0.5)
+        self.assertAlmostEqual(penalty["action_l2_weight"], 0.1)
+        self.assertAlmostEqual(penalty["clip_weight"], 2.0)
 
 
 if __name__ == "__main__":

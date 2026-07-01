@@ -47,6 +47,7 @@ output:
   filename: tworoom_results.txt
 
 diffusion_selection_mode: null
+diffusion_score_topk: null
 diffusion_num_candidates: null
 diffusion_truncation_steps: null
 diffusion_start_timestep: null
@@ -82,6 +83,12 @@ diffusion_refinement: &diffusion_refinement_defaults
   smoothness_weight: null
   grad_clip_norm: null
 
+diffusion_rerank_penalty: &diffusion_rerank_penalty_defaults
+  delta_weight: null
+  jerk_weight: null
+  action_l2_weight: null
+  clip_weight: null
+
 corrective: &corrective_defaults
   enabled: null
   mode: null
@@ -109,6 +116,7 @@ profiles:
     policy: /data/ykz/tworoom/lewm_epoch_67
     diffusion_bundle: /data/ykz/tworoom/diffusion_pipeline/tworoom_diffusion_k128_200000/diffusion_planner_best_bundle.pt
     diffusion_selection_mode: wm_only
+    diffusion_score_topk: null
     diffusion_num_candidates: 128
     diffusion_truncation_steps: null
     diffusion_start_timestep: null
@@ -126,6 +134,12 @@ profiles:
       prior_weight: 0.05
       smoothness_weight: 0.005
       grad_clip_norm: 1.0
+    diffusion_rerank_penalty:
+      <<: *diffusion_rerank_penalty_defaults
+      delta_weight: 0.0
+      jerk_weight: 0.0
+      action_l2_weight: 0.0
+      clip_weight: 0.0
     corrective:
       <<: *corrective_defaults
       enabled: false

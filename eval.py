@@ -55,6 +55,12 @@ PROFILE_SECTION_DEFAULTS = {
         "smoothness_weight": None,
         "grad_clip_norm": None,
     },
+    "diffusion_rerank_penalty": {
+        "delta_weight": None,
+        "jerk_weight": None,
+        "action_l2_weight": None,
+        "clip_weight": None,
+    },
     "corrective": {
         "enabled": None,
         "mode": None,
@@ -76,6 +82,7 @@ PROFILE_SECTION_DEFAULTS = {
 
 PROFILE_SCALAR_DEFAULTS = {
     "diffusion_selection_mode": None,
+    "diffusion_score_topk": None,
     "diffusion_num_candidates": None,
     "diffusion_truncation_steps": None,
     "diffusion_start_timestep": None,
@@ -854,6 +861,29 @@ def resolve_diffusion_refinement_config(cfg: DictConfig) -> dict:
     }
 
 
+def resolve_diffusion_rerank_penalty_config(cfg: DictConfig) -> dict:
+    penalty_cfg = cfg.get("diffusion_rerank_penalty", None)
+    if penalty_cfg is None:
+        return {
+            "delta_weight": 0.0,
+            "jerk_weight": 0.0,
+            "action_l2_weight": 0.0,
+            "clip_weight": 0.0,
+        }
+    container = OmegaConf.to_container(penalty_cfg, resolve=True)
+    if not isinstance(container, dict):
+        raise TypeError(
+            "cfg.diffusion_rerank_penalty must resolve to a dictionary, "
+            f"got {type(container).__name__}."
+        )
+    return {
+        "delta_weight": float(value_or_default(container.get("delta_weight", None), 0.0)),
+        "jerk_weight": float(value_or_default(container.get("jerk_weight", None), 0.0)),
+        "action_l2_weight": float(value_or_default(container.get("action_l2_weight", None), 0.0)),
+        "clip_weight": float(value_or_default(container.get("clip_weight", None), 0.0)),
+    }
+
+
 def resolve_diffusion_runtime_execute_steps(
     diffusion_runtime_execute_steps,
     corrective_cfg: dict,
@@ -1003,6 +1033,7 @@ def run(cfg: DictConfig):
     planner_type = str(cfg.get("planner_type", "mpc")).lower()
     policy_name = cfg.get("policy", "random")
     diffusion_selection_mode = str(cfg.get("diffusion_selection_mode", "wm_only")).lower()
+    diffusion_score_topk = cfg.get("diffusion_score_topk", None)
     diffusion_num_candidates = cfg.get("diffusion_num_candidates", None)
     diffusion_truncation_steps = cfg.get("diffusion_truncation_steps", None)
     diffusion_start_timestep = cfg.get("diffusion_start_timestep", None)
@@ -1012,6 +1043,7 @@ def run(cfg: DictConfig):
     diffusion_runtime_execute_steps = cfg.get("diffusion_runtime_execute_steps", None)
     corrective_cfg = resolve_corrective_config(cfg)
     refinement_cfg = resolve_diffusion_refinement_config(cfg)
+    rerank_penalty_cfg = resolve_diffusion_rerank_penalty_config(cfg)
     trajectory_quality_cfg = resolve_trajectory_quality_config(cfg)
     eval_callables = resolve_eval_callables(cfg)
     if len(eval_callables) == 0:
@@ -1025,6 +1057,11 @@ def run(cfg: DictConfig):
         diffusion_num_candidates = None
     else:
         diffusion_num_candidates = int(diffusion_num_candidates)
+
+    if diffusion_score_topk in [None, "", "null"]:
+        diffusion_score_topk = None
+    else:
+        diffusion_score_topk = int(diffusion_score_topk)
 
     if diffusion_truncation_steps in [None, "", "null"]:
         diffusion_truncation_steps = None
@@ -1150,6 +1187,7 @@ def run(cfg: DictConfig):
             noise_scale=diffusion_noise_scale,
             sampling_temperature=diffusion_sampling_temperature,
             selection_mode=diffusion_selection_mode,
+            score_topk=diffusion_score_topk,
             goal_offset_steps=int(cfg.eval.goal_offset_steps),
             eval_budget=int(cfg.eval.eval_budget),
             runtime_execute_steps=diffusion_runtime_execute_steps,
@@ -1172,6 +1210,10 @@ def run(cfg: DictConfig):
             refinement_prior_weight=float(refinement_cfg["prior_weight"]),
             refinement_smoothness_weight=float(refinement_cfg["smoothness_weight"]),
             refinement_grad_clip_norm=refinement_cfg["grad_clip_norm"],
+            rerank_delta_weight=float(rerank_penalty_cfg["delta_weight"]),
+            rerank_jerk_weight=float(rerank_penalty_cfg["jerk_weight"]),
+            rerank_action_l2_weight=float(rerank_penalty_cfg["action_l2_weight"]),
+            rerank_clip_weight=float(rerank_penalty_cfg["clip_weight"]),
         )
         print(
             "[planner] "
@@ -1195,10 +1237,15 @@ def run(cfg: DictConfig):
             f"noise_scale={policy.proposal_noise_scale:.4f} "
             f"temperature={policy.proposal_sampling_temperature:.4f} "
             f"selection_mode={policy.selection_mode} "
+            f"score_topk={policy.score_topk} "
             f"refinement_enabled={int(policy.refinement_enabled)} "
             f"refinement_steps={policy.refinement_steps} "
             f"refinement_step_size={policy.refinement_step_size:.6f} "
-            f"refinement_topk={policy.refinement_topk}"
+            f"refinement_topk={policy.refinement_topk} "
+            f"rerank_delta_weight={policy.rerank_delta_weight:.6f} "
+            f"rerank_jerk_weight={policy.rerank_jerk_weight:.6f} "
+            f"rerank_action_l2_weight={policy.rerank_action_l2_weight:.6f} "
+            f"rerank_clip_weight={policy.rerank_clip_weight:.6f}"
         )
         if bool(refinement_cfg["enabled"]):
             print(
@@ -1293,6 +1340,7 @@ def run(cfg: DictConfig):
             f"action_block={policy.action_block} action_chunk_horizon={policy.action_chunk_horizon} "
             f"action_dim={policy.action_dim} action_chunk_dim={policy.action_chunk_dim} "
             f"num_candidates={policy.effective_num_candidates} selection_mode={policy.selection_mode} "
+            f"score_topk={policy.score_topk} "
             f"action_clip_low={action_clip_low} action_clip_high={action_clip_high}"
         )
 
@@ -1422,11 +1470,54 @@ def run(cfg: DictConfig):
     scoring_time_total_sec = read_planning_stat(policy, "_scoring_time_total_sec")
     selection_time_total_sec = read_planning_stat(policy, "_selection_time_total_sec")
     refinement_time_total_sec = read_planning_stat(policy, "_refinement_time_total_sec")
+    wm_scoring_time_total_sec = (
+        getattr(policy, "_wm_scoring_time_total_sec", None) if planner_type == "diffusion" else None
+    )
+    wm_rollout_time_total_sec = (
+        getattr(policy, "_wm_rollout_time_total_sec", None) if planner_type == "diffusion" else None
+    )
+    wm_goal_encode_time_total_sec = (
+        getattr(policy, "_wm_goal_encode_time_total_sec", None) if planner_type == "diffusion" else None
+    )
+    wm_criterion_time_total_sec = (
+        getattr(policy, "_wm_criterion_time_total_sec", None) if planner_type == "diffusion" else None
+    )
+    wm_scoring_call_count = (
+        getattr(policy, "_wm_scoring_call_count", None) if planner_type == "diffusion" else None
+    )
+    wm_rollout_candidate_count = (
+        getattr(policy, "_wm_rollout_candidate_count", None) if planner_type == "diffusion" else None
+    )
+    wm_rollout_block_count = (
+        getattr(policy, "_wm_rollout_block_count", None) if planner_type == "diffusion" else None
+    )
+    wm_refinement_rollout_time_total_sec = (
+        getattr(policy, "_wm_refinement_rollout_time_total_sec", None) if planner_type == "diffusion" else None
+    )
+    wm_refinement_rollout_call_count = (
+        getattr(policy, "_wm_refinement_rollout_call_count", None) if planner_type == "diffusion" else None
+    )
+    wm_refinement_rollout_candidate_count = (
+        getattr(policy, "_wm_refinement_rollout_candidate_count", None) if planner_type == "diffusion" else None
+    )
+    wm_refinement_rollout_block_count = (
+        getattr(policy, "_wm_refinement_rollout_block_count", None) if planner_type == "diffusion" else None
+    )
     avg_planning_time_sec = None
     avg_generation_time_sec = None
     avg_refinement_time_sec = None
     avg_scoring_time_sec = None
     avg_selection_time_sec = None
+    avg_wm_scoring_time_sec = None
+    avg_wm_rollout_time_sec = None
+    avg_wm_goal_encode_time_sec = None
+    avg_wm_criterion_time_sec = None
+    wm_rollout_time_per_candidate_ms = None
+    wm_rollout_time_per_block_ms = None
+    avg_wm_refinement_rollout_time_sec = None
+    wm_refinement_rollout_time_per_candidate_ms = None
+    wm_refinement_rollout_time_per_block_ms = None
+    wm_rollout_time_total_with_refinement_sec = None
     if planner_type == "diffusion":
         effective_replans_per_episode = int(
             math.ceil(int(cfg.eval.eval_budget) / int(policy.runtime_execute_steps))
@@ -1449,6 +1540,44 @@ def run(cfg: DictConfig):
             avg_scoring_time_sec = float(scoring_time_total_sec) / float(global_planning_calls)
         if selection_time_total_sec is not None:
             avg_selection_time_sec = float(selection_time_total_sec) / float(global_planning_calls)
+    if wm_scoring_call_count is not None and int(wm_scoring_call_count) > 0:
+        if wm_scoring_time_total_sec is not None:
+            avg_wm_scoring_time_sec = float(wm_scoring_time_total_sec) / float(wm_scoring_call_count)
+        if wm_rollout_time_total_sec is not None:
+            avg_wm_rollout_time_sec = float(wm_rollout_time_total_sec) / float(wm_scoring_call_count)
+        if wm_goal_encode_time_total_sec is not None:
+            avg_wm_goal_encode_time_sec = float(wm_goal_encode_time_total_sec) / float(wm_scoring_call_count)
+        if wm_criterion_time_total_sec is not None:
+            avg_wm_criterion_time_sec = float(wm_criterion_time_total_sec) / float(wm_scoring_call_count)
+    if wm_rollout_candidate_count is not None and int(wm_rollout_candidate_count) > 0:
+        wm_rollout_time_per_candidate_ms = (
+            1000.0 * float(wm_rollout_time_total_sec or 0.0) / float(wm_rollout_candidate_count)
+        )
+    if wm_rollout_block_count is not None and int(wm_rollout_block_count) > 0:
+        wm_rollout_time_per_block_ms = (
+            1000.0 * float(wm_rollout_time_total_sec or 0.0) / float(wm_rollout_block_count)
+        )
+    if wm_refinement_rollout_call_count is not None and int(wm_refinement_rollout_call_count) > 0:
+        avg_wm_refinement_rollout_time_sec = (
+            float(wm_refinement_rollout_time_total_sec or 0.0)
+            / float(wm_refinement_rollout_call_count)
+        )
+    if wm_refinement_rollout_candidate_count is not None and int(wm_refinement_rollout_candidate_count) > 0:
+        wm_refinement_rollout_time_per_candidate_ms = (
+            1000.0
+            * float(wm_refinement_rollout_time_total_sec or 0.0)
+            / float(wm_refinement_rollout_candidate_count)
+        )
+    if wm_refinement_rollout_block_count is not None and int(wm_refinement_rollout_block_count) > 0:
+        wm_refinement_rollout_time_per_block_ms = (
+            1000.0
+            * float(wm_refinement_rollout_time_total_sec or 0.0)
+            / float(wm_refinement_rollout_block_count)
+        )
+    if planner_type == "diffusion":
+        wm_rollout_time_total_with_refinement_sec = float(wm_rollout_time_total_sec or 0.0) + float(
+            wm_refinement_rollout_time_total_sec or 0.0
+        )
     if corrective_check_count is not None and int(corrective_check_count) > 0:
         corrective_replan_rate = float(corrective_replan_count or 0) / float(corrective_check_count)
     if corrective_replan_error_records:
@@ -1528,6 +1657,53 @@ def run(cfg: DictConfig):
         print(f"[planner-stats] avg_scoring_time_sec={avg_scoring_time_sec:.6f}")
     if avg_selection_time_sec is not None:
         print(f"[planner-stats] avg_selection_time_sec={avg_selection_time_sec:.6f}")
+    if planner_type == "diffusion":
+        print(f"[worldmodel-stats] wm_scoring_call_count={int(wm_scoring_call_count or 0)}")
+        print(f"[worldmodel-stats] wm_scoring_time_total_sec={float(wm_scoring_time_total_sec or 0.0):.6f}")
+        if avg_wm_scoring_time_sec is not None:
+            print(f"[worldmodel-stats] avg_wm_scoring_time_sec={avg_wm_scoring_time_sec:.6f}")
+        print(f"[worldmodel-stats] wm_goal_encode_time_total_sec={float(wm_goal_encode_time_total_sec or 0.0):.6f}")
+        if avg_wm_goal_encode_time_sec is not None:
+            print(f"[worldmodel-stats] avg_wm_goal_encode_time_sec={avg_wm_goal_encode_time_sec:.6f}")
+        print(f"[worldmodel-stats] wm_rollout_time_total_sec={float(wm_rollout_time_total_sec or 0.0):.6f}")
+        if avg_wm_rollout_time_sec is not None:
+            print(f"[worldmodel-stats] avg_wm_rollout_time_sec={avg_wm_rollout_time_sec:.6f}")
+        print(f"[worldmodel-stats] wm_rollout_candidate_count={int(wm_rollout_candidate_count or 0)}")
+        print(f"[worldmodel-stats] wm_rollout_block_count={int(wm_rollout_block_count or 0)}")
+        if wm_rollout_time_per_candidate_ms is not None:
+            print(f"[worldmodel-stats] wm_rollout_time_per_candidate_ms={wm_rollout_time_per_candidate_ms:.6f}")
+        if wm_rollout_time_per_block_ms is not None:
+            print(f"[worldmodel-stats] wm_rollout_time_per_block_ms={wm_rollout_time_per_block_ms:.6f}")
+        print(f"[worldmodel-stats] wm_criterion_time_total_sec={float(wm_criterion_time_total_sec or 0.0):.6f}")
+        if avg_wm_criterion_time_sec is not None:
+            print(f"[worldmodel-stats] avg_wm_criterion_time_sec={avg_wm_criterion_time_sec:.6f}")
+        print(
+            "[worldmodel-stats] "
+            f"wm_refinement_rollout_time_total_sec={float(wm_refinement_rollout_time_total_sec or 0.0):.6f}"
+        )
+        print(
+            "[worldmodel-stats] "
+            f"wm_refinement_rollout_call_count={int(wm_refinement_rollout_call_count or 0)}"
+        )
+        if avg_wm_refinement_rollout_time_sec is not None:
+            print(
+                "[worldmodel-stats] "
+                f"avg_wm_refinement_rollout_time_sec={avg_wm_refinement_rollout_time_sec:.6f}"
+            )
+        if wm_refinement_rollout_time_per_candidate_ms is not None:
+            print(
+                "[worldmodel-stats] "
+                f"wm_refinement_rollout_time_per_candidate_ms={wm_refinement_rollout_time_per_candidate_ms:.6f}"
+            )
+        if wm_refinement_rollout_time_per_block_ms is not None:
+            print(
+                "[worldmodel-stats] "
+                f"wm_refinement_rollout_time_per_block_ms={wm_refinement_rollout_time_per_block_ms:.6f}"
+            )
+        print(
+            "[worldmodel-stats] "
+            f"wm_rollout_time_total_with_refinement_sec={float(wm_rollout_time_total_with_refinement_sec or 0.0):.6f}"
+        )
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1563,6 +1739,7 @@ def run(cfg: DictConfig):
             f.write(f"config_name: {config_name}\n")
             f.write(f"policy: {cfg.policy}\n")
             f.write(f"diffusion_selection_mode: {diffusion_selection_mode}\n")
+            f.write(f"diffusion_score_topk: {policy.score_topk}\n")
             f.write(f"diffusion_num_candidates: {policy.effective_num_candidates}\n")
             f.write(f"diffusion_base_num_candidates: {policy.base_num_candidates}\n")
             f.write(f"diffusion_proposal_rounds: {policy.proposal_rounds}\n")
@@ -1579,6 +1756,10 @@ def run(cfg: DictConfig):
             f.write(f"diffusion_refinement_prior_weight: {float(refinement_cfg['prior_weight'])}\n")
             f.write(f"diffusion_refinement_smoothness_weight: {float(refinement_cfg['smoothness_weight'])}\n")
             f.write(f"diffusion_refinement_grad_clip_norm: {refinement_cfg['grad_clip_norm']}\n")
+            f.write(f"diffusion_rerank_delta_weight: {float(rerank_penalty_cfg['delta_weight'])}\n")
+            f.write(f"diffusion_rerank_jerk_weight: {float(rerank_penalty_cfg['jerk_weight'])}\n")
+            f.write(f"diffusion_rerank_action_l2_weight: {float(rerank_penalty_cfg['action_l2_weight'])}\n")
+            f.write(f"diffusion_rerank_clip_weight: {float(rerank_penalty_cfg['clip_weight'])}\n")
             f.write(f"goal_offset: {policy.goal_offset_steps}\n")
             f.write(f"eval_budget: {policy.eval_budget}\n")
             f.write(f"block_horizon: {policy.block_horizon}\n")
@@ -1649,6 +1830,55 @@ def run(cfg: DictConfig):
             f.write(f"avg_scoring_time_sec: {avg_scoring_time_sec}\n")
         if avg_selection_time_sec is not None:
             f.write(f"avg_selection_time_sec: {avg_selection_time_sec}\n")
+        if planner_type == "diffusion":
+            f.write(f"wm_scoring_call_count: {int(wm_scoring_call_count or 0)}\n")
+            f.write(f"wm_scoring_time_total_sec: {float(wm_scoring_time_total_sec or 0.0)}\n")
+            if avg_wm_scoring_time_sec is not None:
+                f.write(f"avg_wm_scoring_time_sec: {avg_wm_scoring_time_sec}\n")
+            f.write(f"wm_goal_encode_time_total_sec: {float(wm_goal_encode_time_total_sec or 0.0)}\n")
+            if avg_wm_goal_encode_time_sec is not None:
+                f.write(f"avg_wm_goal_encode_time_sec: {avg_wm_goal_encode_time_sec}\n")
+            f.write(f"wm_rollout_time_total_sec: {float(wm_rollout_time_total_sec or 0.0)}\n")
+            if avg_wm_rollout_time_sec is not None:
+                f.write(f"avg_wm_rollout_time_sec: {avg_wm_rollout_time_sec}\n")
+            f.write(f"wm_rollout_candidate_count: {int(wm_rollout_candidate_count or 0)}\n")
+            f.write(f"wm_rollout_block_count: {int(wm_rollout_block_count or 0)}\n")
+            if wm_rollout_time_per_candidate_ms is not None:
+                f.write(f"wm_rollout_time_per_candidate_ms: {wm_rollout_time_per_candidate_ms}\n")
+            if wm_rollout_time_per_block_ms is not None:
+                f.write(f"wm_rollout_time_per_block_ms: {wm_rollout_time_per_block_ms}\n")
+            f.write(f"wm_criterion_time_total_sec: {float(wm_criterion_time_total_sec or 0.0)}\n")
+            if avg_wm_criterion_time_sec is not None:
+                f.write(f"avg_wm_criterion_time_sec: {avg_wm_criterion_time_sec}\n")
+            f.write(
+                "wm_refinement_rollout_time_total_sec: "
+                f"{float(wm_refinement_rollout_time_total_sec or 0.0)}\n"
+            )
+            f.write(f"wm_refinement_rollout_call_count: {int(wm_refinement_rollout_call_count or 0)}\n")
+            f.write(
+                "wm_refinement_rollout_candidate_count: "
+                f"{int(wm_refinement_rollout_candidate_count or 0)}\n"
+            )
+            f.write(
+                "wm_refinement_rollout_block_count: "
+                f"{int(wm_refinement_rollout_block_count or 0)}\n"
+            )
+            if avg_wm_refinement_rollout_time_sec is not None:
+                f.write(f"avg_wm_refinement_rollout_time_sec: {avg_wm_refinement_rollout_time_sec}\n")
+            if wm_refinement_rollout_time_per_candidate_ms is not None:
+                f.write(
+                    "wm_refinement_rollout_time_per_candidate_ms: "
+                    f"{wm_refinement_rollout_time_per_candidate_ms}\n"
+                )
+            if wm_refinement_rollout_time_per_block_ms is not None:
+                f.write(
+                    "wm_refinement_rollout_time_per_block_ms: "
+                    f"{wm_refinement_rollout_time_per_block_ms}\n"
+                )
+            f.write(
+                "wm_rollout_time_total_with_refinement_sec: "
+                f"{float(wm_rollout_time_total_with_refinement_sec or 0.0)}\n"
+            )
         if trajectory_quality_result is not None:
             f.write(f"trajectory_quality_enabled: {bool(trajectory_quality_cfg['enabled'])}\n")
             f.write(f"trajectory_quality_summary: {trajectory_quality_result['summary']}\n")

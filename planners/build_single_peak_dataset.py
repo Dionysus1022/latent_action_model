@@ -112,6 +112,23 @@ def parse_args() -> argparse.Namespace:
         help="trajectory: labels come from raw action chunks in the HDF5 trajectory; teacher: labels come from MPC-CEM.",
     )
     parser.add_argument(
+        "--plan-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Optional flattened action horizon override. When set, the builder derives "
+            "receding_horizon from --plan-horizon and --action-block instead of the eval config."
+        ),
+    )
+    parser.add_argument(
+        "--action-block",
+        type=int,
+        default=None,
+        help=(
+            "Action block size used with --plan-horizon. Defaults to the eval config action_block."
+        ),
+    )
+    parser.add_argument(
         "--num-samples",
         type=int,
         required=True,
@@ -385,8 +402,23 @@ def resolve_task_spec(args: argparse.Namespace, cfg: DictConfig, dataset) -> Tas
     dataset_name = str(require_cfg_value(cfg, "eval.dataset_name"))
     goal_offset_steps = int(require_cfg_value(cfg, "eval.goal_offset_steps"))
     eval_budget = int(require_cfg_value(cfg, "eval.eval_budget"))
-    receding_horizon = int(require_cfg_value(cfg, "plan_config.receding_horizon"))
-    action_block = int(require_cfg_value(cfg, "plan_config.action_block"))
+    config_receding_horizon = int(require_cfg_value(cfg, "plan_config.receding_horizon"))
+    config_action_block = int(require_cfg_value(cfg, "plan_config.action_block"))
+    action_block = config_action_block if args.action_block is None else int(args.action_block)
+    if args.plan_horizon is None:
+        receding_horizon = config_receding_horizon
+    else:
+        plan_horizon = int(args.plan_horizon)
+        if plan_horizon <= 0:
+            raise ValueError(f"--plan-horizon must be positive, got {plan_horizon}.")
+        if action_block <= 0:
+            raise ValueError(f"--action-block must be positive, got {action_block}.")
+        if plan_horizon % action_block != 0:
+            raise ValueError(
+                "--plan-horizon must be divisible by --action-block: "
+                f"{plan_horizon} % {action_block} != 0."
+            )
+        receding_horizon = int(plan_horizon // action_block)
     if goal_offset_steps <= 0:
         raise ValueError(f"goal_offset_steps must be positive, got {goal_offset_steps}.")
     if eval_budget <= 0:
@@ -662,6 +694,9 @@ def collate_samples(
     z_goal = torch.stack([sample["z_goal"] for sample in samples], dim=0)  # [N, embed_dim]
     teacher_plan = torch.stack([sample["teacher_plan"] for sample in samples], dim=0)  # [N, action_chunk_dim]
     meta = [sample["meta"] for sample in samples]
+    plan_config = dict(OmegaConf.to_container(cfg.plan_config, resolve=True))
+    plan_config["receding_horizon"] = int(task_spec.receding_horizon)
+    plan_config["action_block"] = int(task_spec.action_block)
     return {
         "z_cur": z_cur,
         "z_goal": z_goal,
@@ -688,7 +723,7 @@ def collate_samples(
             "action_key": task_spec.action_key,
             "episode_key": task_spec.episode_key,
             "step_key": task_spec.step_key,
-            "plan_config": OmegaConf.to_container(cfg.plan_config, resolve=True),
+            "plan_config": plan_config,
             "task_spec": asdict(task_spec),
         },
     }

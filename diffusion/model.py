@@ -41,12 +41,19 @@ class DiffusionPlannerModelConfig:
     activation: str = "gelu"
     timestep_embedding_dim: int = 128
     fusion_num_layers: int = 2
+    denoiser_type: str = "mlp"
+    dit_num_layers: int = 4
+    dit_num_heads: int = 4
+    dit_mlp_ratio: float = 4.0
     num_train_steps: int = 16
     truncation_steps: int = 4
     start_timestep: int | None = None
     beta_schedule: str = "linear"
     beta_start: float = 1e-4
     beta_end: float = 2e-2
+    score_head_type: str = "linear"
+    score_head_hidden_dim: int | None = None
+    score_head_num_layers: int = 2
 
     @property
     def input_dim(self) -> int:
@@ -179,12 +186,19 @@ def infer_model_config_from_dataset_and_anchor_bundle(
     activation: str = "gelu",
     timestep_embedding_dim: int = 128,
     fusion_num_layers: int = 2,
+    denoiser_type: str = "mlp",
+    dit_num_layers: int = 4,
+    dit_num_heads: int = 4,
+    dit_mlp_ratio: float = 4.0,
     num_train_steps: int = 16,
     truncation_steps: int = 4,
     start_timestep: int | None = None,
     beta_schedule: str = "linear",
     beta_start: float = 1e-4,
     beta_end: float = 2e-2,
+    score_head_type: str = "linear",
+    score_head_hidden_dim: int | None = None,
+    score_head_num_layers: int = 2,
 ) -> DiffusionPlannerModelConfig:
     """Infer diffusion planner dimensions from a dataset bundle and an anchor bundle."""
     dataset_cfg = infer_diffusion_dataset_config(dataset_bundle, anchor_bundle=anchor_bundle)
@@ -218,12 +232,19 @@ def infer_model_config_from_dataset_and_anchor_bundle(
         activation=str(activation),
         timestep_embedding_dim=int(timestep_embedding_dim),
         fusion_num_layers=int(fusion_num_layers),
+        denoiser_type=str(denoiser_type),
+        dit_num_layers=int(dit_num_layers),
+        dit_num_heads=int(dit_num_heads),
+        dit_mlp_ratio=float(dit_mlp_ratio),
         num_train_steps=int(num_train_steps),
         truncation_steps=int(truncation_steps),
         start_timestep=None if start_timestep is None else int(start_timestep),
         beta_schedule=str(beta_schedule),
         beta_start=float(beta_start),
         beta_end=float(beta_end),
+        score_head_type=str(score_head_type),
+        score_head_hidden_dim=None if score_head_hidden_dim is None else int(score_head_hidden_dim),
+        score_head_num_layers=int(score_head_num_layers),
     )
 
 
@@ -260,6 +281,67 @@ def ensure_batched_candidates(
     raise ValueError(
         f"{name} must have shape [K, action_chunk_dim] or [B, K, action_chunk_dim], got {tuple(candidates.shape)}."
     )
+
+
+class DiTActionBlock(nn.Module):
+    """Transformer block for action-token denoising with latent cross-attention."""
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        num_heads: int,
+        mlp_ratio: float,
+        dropout: float,
+        activation: str,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}.")
+        act_factory = get_activation_factory(activation)
+        mlp_hidden_dim = int(round(float(hidden_dim) * float(mlp_ratio)))
+        if mlp_hidden_dim <= 0:
+            raise ValueError(f"mlp_ratio must produce a positive hidden size, got {mlp_ratio}.")
+        self.self_norm = nn.LayerNorm(hidden_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.mlp_norm = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden_dim),
+            act_factory(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(mlp_hidden_dim, hidden_dim),
+            nn.Dropout(float(dropout)),
+        )
+
+    def forward(self, action_tokens: torch.Tensor, condition_tokens: torch.Tensor) -> torch.Tensor:
+        self_out, _ = self.self_attn(
+            self.self_norm(action_tokens),
+            self.self_norm(action_tokens),
+            self.self_norm(action_tokens),
+            need_weights=False,
+        )
+        action_tokens = action_tokens + self_out
+        cross_out, _ = self.cross_attn(
+            self.cross_norm(action_tokens),
+            condition_tokens,
+            condition_tokens,
+            need_weights=False,
+        )
+        action_tokens = action_tokens + cross_out
+        action_tokens = action_tokens + self.mlp(self.mlp_norm(action_tokens))
+        return action_tokens
 
 
 class DiffusionPlannerModel(nn.Module):
@@ -313,6 +395,9 @@ class DiffusionPlannerModel(nn.Module):
         )
         self._register_schedule_buffers(schedule)
 
+        self.denoiser_type = str(config.denoiser_type).lower().strip()
+        if self.denoiser_type not in {"mlp", "dit"}:
+            raise ValueError(f"Unsupported denoiser_type '{config.denoiser_type}'. Expected mlp or dit.")
         act_factory = get_activation_factory(config.activation)
         self.condition_trunk = build_mlp_trunk(
             input_dim=config.input_dim,
@@ -321,25 +406,95 @@ class DiffusionPlannerModel(nn.Module):
             dropout=config.dropout,
             activation=config.activation,
         )
-        self.candidate_encoder = nn.Sequential(
-            nn.Linear(config.action_chunk_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
-            act_factory(),
-        )
         self.timestep_encoder = nn.Sequential(
             nn.Linear(config.timestep_embedding_dim, config.hidden_dim),
             nn.LayerNorm(config.hidden_dim),
             act_factory(),
         )
-        self.fusion_trunk = build_mlp_trunk(
-            input_dim=3 * config.hidden_dim,
-            hidden_dim=config.hidden_dim,
-            num_layers=config.fusion_num_layers,
-            dropout=config.dropout,
-            activation=config.activation,
+        if self.denoiser_type == "mlp":
+            self.candidate_encoder = nn.Sequential(
+                nn.Linear(config.action_chunk_dim, config.hidden_dim),
+                nn.LayerNorm(config.hidden_dim),
+                act_factory(),
+            )
+            self.fusion_trunk = build_mlp_trunk(
+                input_dim=3 * config.hidden_dim,
+                hidden_dim=config.hidden_dim,
+                num_layers=config.fusion_num_layers,
+                dropout=config.dropout,
+                activation=config.activation,
+            )
+            self.action_head = nn.Linear(config.hidden_dim, config.action_chunk_dim)
+            self.step_action_encoder = None
+            self.action_pos_embedding = None
+            self.condition_token_encoder = None
+            self.dit_blocks = None
+            self.dit_final_norm = None
+            self.step_action_head = None
+        else:
+            self.candidate_encoder = None
+            self.fusion_trunk = None
+            self.action_head = None
+            self.step_action_encoder = nn.Sequential(
+                nn.Linear(config.action_dim, config.hidden_dim),
+                nn.LayerNorm(config.hidden_dim),
+                act_factory(),
+            )
+            self.action_pos_embedding = nn.Parameter(
+                torch.zeros(1, config.plan_horizon, config.hidden_dim)
+            )
+            self.condition_token_encoder = nn.Sequential(
+                nn.Linear(config.latent_dim, config.hidden_dim),
+                nn.LayerNorm(config.hidden_dim),
+                act_factory(),
+            )
+            self.dit_blocks = nn.ModuleList(
+                [
+                    DiTActionBlock(
+                        hidden_dim=config.hidden_dim,
+                        num_heads=int(config.dit_num_heads),
+                        mlp_ratio=float(config.dit_mlp_ratio),
+                        dropout=float(config.dropout),
+                        activation=config.activation,
+                    )
+                    for _ in range(int(config.dit_num_layers))
+                ]
+            )
+            self.dit_final_norm = nn.LayerNorm(config.hidden_dim)
+            self.step_action_head = nn.Linear(config.hidden_dim, config.action_dim)
+        self.score_head = self._build_score_head(config)
+
+    @staticmethod
+    def _build_score_head(config: DiffusionPlannerModelConfig) -> nn.Module:
+        score_head_type = str(config.score_head_type).lower().strip()
+        if score_head_type == "linear":
+            return nn.Linear(config.hidden_dim, 1)
+        if score_head_type != "mlp":
+            raise ValueError(
+                f"Unsupported score_head_type '{config.score_head_type}'. Expected linear or mlp."
+            )
+        hidden_dim = (
+            int(config.score_head_hidden_dim)
+            if config.score_head_hidden_dim is not None
+            else int(config.hidden_dim)
         )
-        self.action_head = nn.Linear(config.hidden_dim, config.action_chunk_dim)
-        self.score_head = nn.Linear(config.hidden_dim, 1)
+        if hidden_dim <= 0:
+            raise ValueError(f"score_head_hidden_dim must be positive, got {hidden_dim}.")
+        if int(config.score_head_num_layers) <= 0:
+            raise ValueError(
+                f"score_head_num_layers must be positive, got {config.score_head_num_layers}."
+            )
+        act_factory = get_activation_factory(config.activation)
+        layers: list[nn.Module] = [nn.LayerNorm(config.hidden_dim)]
+        in_dim = int(config.hidden_dim)
+        for _ in range(int(config.score_head_num_layers)):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(act_factory())
+            if float(config.dropout) > 0.0:
+                layers.append(nn.Dropout(float(config.dropout)))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, 1))
+        return nn.Sequential(*layers)
 
     def _register_schedule_buffers(self, schedule: TruncatedDiffusionSchedule) -> None:
         validate_diffusion_schedule(schedule)
@@ -553,6 +708,103 @@ class DiffusionPlannerModel(nn.Module):
         )  # [B, K, action_chunk_dim]
         return noisy_candidates, timestep_grid
 
+    def _forward_mlp_denoiser(
+        self,
+        *,
+        condition: torch.Tensor,
+        candidates: torch.Tensor,
+        timestep_grid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(condition.shape[0])
+        condition_features = condition.unsqueeze(1).expand(-1, self.num_anchors, -1)  # [B, K, hidden_dim]
+        candidate_features = self.candidate_encoder(
+            candidates.reshape(batch_size * self.num_anchors, self.action_chunk_dim)
+        ).reshape(batch_size, self.num_anchors, -1)  # [B, K, hidden_dim]
+        timestep_embedding = get_timestep_embedding(
+            timestep_grid,
+            embedding_dim=self.config.timestep_embedding_dim,
+            device=candidates.device,
+            dtype=candidates.dtype,
+        )  # [B, K, timestep_embedding_dim]
+        timestep_features = self.timestep_encoder(
+            timestep_embedding.reshape(batch_size * self.num_anchors, self.config.timestep_embedding_dim)
+        ).reshape(batch_size, self.num_anchors, -1)  # [B, K, hidden_dim]
+
+        fused = torch.cat(
+            [condition_features, candidate_features, timestep_features],
+            dim=-1,
+        )  # [B, K, 3 * hidden_dim]
+        fused = self.fusion_trunk(
+            fused.reshape(batch_size * self.num_anchors, 3 * self.config.hidden_dim)
+        ).reshape(batch_size, self.num_anchors, -1)  # [B, K, hidden_dim]
+
+        refined_actions = self.action_head(
+            fused.reshape(batch_size * self.num_anchors, self.config.hidden_dim)
+        ).reshape(batch_size, self.num_anchors, self.action_chunk_dim)  # [B, K, action_chunk_dim]
+        score_logits = self.score_head(
+            fused.reshape(batch_size * self.num_anchors, self.config.hidden_dim)
+        ).reshape(batch_size, self.num_anchors)  # [B, K]
+        return refined_actions, score_logits
+
+    def _forward_dit_denoiser(
+        self,
+        *,
+        z_cur: torch.Tensor,
+        z_goal: torch.Tensor,
+        candidates: torch.Tensor,
+        timestep_grid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(z_cur.shape[0])
+        action_steps = candidates.reshape(
+            batch_size,
+            self.num_anchors,
+            self.plan_horizon,
+            self.action_dim,
+        )  # [B, K, H, A]
+        flat_steps = action_steps.reshape(batch_size * self.num_anchors, self.plan_horizon, self.action_dim)
+        action_tokens = self.step_action_encoder(
+            flat_steps.reshape(batch_size * self.num_anchors * self.plan_horizon, self.action_dim)
+        ).reshape(batch_size * self.num_anchors, self.plan_horizon, self.config.hidden_dim)
+        action_tokens = action_tokens + self.action_pos_embedding.to(device=action_tokens.device, dtype=action_tokens.dtype)
+
+        timestep_embedding = get_timestep_embedding(
+            timestep_grid,
+            embedding_dim=self.config.timestep_embedding_dim,
+            device=candidates.device,
+            dtype=candidates.dtype,
+        )  # [B, K, timestep_embedding_dim]
+        timestep_tokens = self.timestep_encoder(
+            timestep_embedding.reshape(batch_size * self.num_anchors, self.config.timestep_embedding_dim)
+        ).reshape(batch_size * self.num_anchors, 1, self.config.hidden_dim)
+        action_tokens = action_tokens + timestep_tokens
+
+        latent_tokens = torch.stack(
+            [z_cur, z_goal, z_goal - z_cur],
+            dim=1,
+        )  # [B, 3, latent_dim]
+        condition_tokens = self.condition_token_encoder(
+            latent_tokens.reshape(batch_size * 3, self.latent_dim)
+        ).reshape(batch_size, 3, self.config.hidden_dim)  # [B, 3, hidden_dim]
+        condition_tokens = condition_tokens.unsqueeze(1).expand(
+            batch_size,
+            self.num_anchors,
+            3,
+            self.config.hidden_dim,
+        ).reshape(batch_size * self.num_anchors, 3, self.config.hidden_dim)
+
+        for block in self.dit_blocks:
+            action_tokens = block(action_tokens, condition_tokens)
+        action_tokens = self.dit_final_norm(action_tokens)
+        refined_steps = self.step_action_head(
+            action_tokens.reshape(batch_size * self.num_anchors * self.plan_horizon, self.config.hidden_dim)
+        ).reshape(batch_size, self.num_anchors, self.plan_horizon, self.action_dim)
+        refined_actions = refined_steps.reshape(batch_size, self.num_anchors, self.action_chunk_dim)
+        pooled = action_tokens.mean(dim=1).reshape(batch_size, self.num_anchors, self.config.hidden_dim)
+        score_logits = self.score_head(
+            pooled.reshape(batch_size * self.num_anchors, self.config.hidden_dim)
+        ).reshape(batch_size, self.num_anchors)
+        return refined_actions, score_logits
+
     def forward(
         self,
         z_cur: torch.Tensor,
@@ -595,34 +847,21 @@ class DiffusionPlannerModel(nn.Module):
             device=candidates.device,
         )  # [B, K]
 
-        condition_features = condition.unsqueeze(1).expand(-1, self.num_anchors, -1)  # [B, K, hidden_dim]
-        candidate_features = self.candidate_encoder(
-            candidates.reshape(batch_size * self.num_anchors, self.action_chunk_dim)
-        ).reshape(batch_size, self.num_anchors, -1)  # [B, K, hidden_dim]
-        timestep_embedding = get_timestep_embedding(
-            timestep_grid,
-            embedding_dim=self.config.timestep_embedding_dim,
-            device=candidates.device,
-            dtype=candidates.dtype,
-        )  # [B, K, timestep_embedding_dim]
-        timestep_features = self.timestep_encoder(
-            timestep_embedding.reshape(batch_size * self.num_anchors, self.config.timestep_embedding_dim)
-        ).reshape(batch_size, self.num_anchors, -1)  # [B, K, hidden_dim]
-
-        fused = torch.cat(
-            [condition_features, candidate_features, timestep_features],
-            dim=-1,
-        )  # [B, K, 3 * hidden_dim]
-        fused = self.fusion_trunk(
-            fused.reshape(batch_size * self.num_anchors, 3 * self.config.hidden_dim)
-        ).reshape(batch_size, self.num_anchors, -1)  # [B, K, hidden_dim]
-
-        refined_actions = self.action_head(
-            fused.reshape(batch_size * self.num_anchors, self.config.hidden_dim)
-        ).reshape(batch_size, self.num_anchors, self.action_chunk_dim)  # [B, K, action_chunk_dim]
-        score_logits = self.score_head(
-            fused.reshape(batch_size * self.num_anchors, self.config.hidden_dim)
-        ).reshape(batch_size, self.num_anchors)  # [B, K]
+        if self.denoiser_type == "mlp":
+            refined_actions, score_logits = self._forward_mlp_denoiser(
+                condition=condition,
+                candidates=candidates,
+                timestep_grid=timestep_grid,
+            )
+        else:
+            z_cur_batched, _ = ensure_batched_latents(z_cur, self.latent_dim, name="z_cur")
+            z_goal_batched, _ = ensure_batched_latents(z_goal, self.latent_dim, name="z_goal")
+            refined_actions, score_logits = self._forward_dit_denoiser(
+                z_cur=z_cur_batched,
+                z_goal=z_goal_batched,
+                candidates=candidates,
+                timestep_grid=timestep_grid,
+            )
 
         expanded_anchors = self.expand_anchors(
             batch_size,

@@ -47,6 +47,11 @@ def make_refinement_policy(*, enabled: bool):
     policy.refinement_prior_weight = 0.0
     policy.refinement_smoothness_weight = 0.0
     policy.refinement_grad_clip_norm = None
+    policy.score_topk = None
+    policy.rerank_delta_weight = 0.0
+    policy.rerank_jerk_weight = 0.0
+    policy.rerank_action_l2_weight = 0.0
+    policy.rerank_clip_weight = 0.0
     policy._last_refinement_cost_before = None
     policy._last_refinement_cost_after = None
     policy._last_refinement_goal_cost_before = None
@@ -54,7 +59,21 @@ def make_refinement_policy(*, enabled: bool):
     policy._last_refinement_delta_norm = None
     policy._last_refinement_candidate_count = 0
     policy._last_refinement_steps = 0
+    policy._last_score_topk_indices = None
+    policy._last_score_topk_world_model_costs = None
+    policy._last_score_topk_model_scores = None
     policy._refinement_time_total_sec = 0.0
+    policy._wm_scoring_time_total_sec = 0.0
+    policy._wm_rollout_time_total_sec = 0.0
+    policy._wm_goal_encode_time_total_sec = 0.0
+    policy._wm_criterion_time_total_sec = 0.0
+    policy._wm_scoring_call_count = 0
+    policy._wm_rollout_candidate_count = 0
+    policy._wm_rollout_block_count = 0
+    policy._wm_refinement_rollout_time_total_sec = 0.0
+    policy._wm_refinement_rollout_call_count = 0
+    policy._wm_refinement_rollout_candidate_count = 0
+    policy._wm_refinement_rollout_block_count = 0
     return policy
 
 
@@ -166,6 +185,83 @@ class DiffusionPolicyRefinementTest(unittest.TestCase):
         self.assertTrue(torch.equal(refined[:, 0, :], candidates[:, 0, :]))
         self.assertFalse(torch.equal(refined[:, 1, :], candidates[:, 1, :]))
         self.assertEqual(policy._last_refinement_candidate_count, 1)
+
+    def test_smoothness_penalty_can_override_lower_world_model_cost(self):
+        policy = make_refinement_policy(enabled=False)
+        policy.selection_mode = "wm_only"
+        policy.planner.plan_horizon = 4
+        policy.planner.action_dim = 1
+        policy.planner.action_chunk_dim = 4
+        policy.rerank_delta_weight = 1.0
+        policy.rerank_jerk_weight = 1.0
+        candidates = torch.tensor([[[0.0, 2.0, -2.0, 2.0], [0.2, 0.2, 0.2, 0.2]]])
+        world_model_costs = torch.tensor([[0.0, 1.0]])
+        model_scores = torch.tensor([[0.0, 0.0]])
+
+        selected, selected_indices, _ = policy.select_best_candidates(
+            candidates,
+            world_model_costs,
+            model_scores,
+        )
+
+        self.assertEqual(selected_indices.tolist(), [1])
+        self.assertTrue(torch.equal(selected, candidates[:, 1, :]))
+
+    def test_clip_penalty_prefers_in_range_candidate(self):
+        policy = make_refinement_policy(enabled=False)
+        policy.selection_mode = "wm_only"
+        policy.planner.plan_horizon = 2
+        policy.planner.action_dim = 1
+        policy.planner.action_chunk_dim = 2
+        policy.rerank_clip_weight = 10.0
+        policy._action_low = torch.tensor([-1.0]).numpy()
+        policy._action_high = torch.tensor([1.0]).numpy()
+        candidates = torch.tensor([[[1.5, 1.5], [0.9, 0.9]]])
+        world_model_costs = torch.tensor([[0.0, 1.0]])
+        model_scores = torch.tensor([[0.0, 0.0]])
+
+        _, selected_indices, _ = policy.select_best_candidates(
+            candidates,
+            world_model_costs,
+            model_scores,
+        )
+
+        self.assertEqual(selected_indices.tolist(), [1])
+
+    def test_score_topk_wm_scores_only_score_prefiltered_candidates(self):
+        policy = make_refinement_policy(enabled=False)
+        policy.selection_mode = "score_topk_wm"
+        policy.score_topk = 3
+        policy._last_score_topk_indices = None
+        policy._last_score_topk_world_model_costs = None
+        policy._last_score_topk_model_scores = None
+        prepared_info = {
+            "pixels": torch.zeros(1, 1, 1, 1, 1),
+            "goal": torch.zeros(1, 1, 1, 1, 1),
+        }
+        candidates = torch.arange(8, dtype=torch.float32).view(1, 8, 1).repeat(1, 1, 2)
+        model_scores = torch.tensor([[0.1, 9.0, 0.2, 7.0, 0.3, 8.0, 0.4, 0.5]])
+        seen_candidates = []
+
+        def fake_score_candidates(prepared, score_candidates):
+            seen_candidates.append(score_candidates.detach().clone())
+            self.assertEqual(tuple(score_candidates.shape), (1, 3, 2))
+            # score top3 original indices are [1, 5, 3]; choose original index 5.
+            return torch.tensor([[5.0, 1.0, 3.0]])
+
+        policy.score_candidates_with_world_model = fake_score_candidates
+
+        selected, selected_indices, fallback_mask = policy.score_and_select_candidates(
+            prepared_info,
+            candidates,
+            model_scores,
+        )
+
+        self.assertEqual(selected_indices.tolist(), [5])
+        self.assertFalse(bool(fallback_mask.item()))
+        self.assertTrue(torch.equal(selected, candidates[:, 5, :]))
+        self.assertEqual(policy._last_score_topk_indices.tolist(), [[1, 5, 3]])
+        self.assertEqual(len(seen_candidates), 1)
 
 
 if __name__ == "__main__":

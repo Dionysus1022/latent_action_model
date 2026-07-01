@@ -19,8 +19,10 @@ from diffusion.model import (
     DiffusionPlannerModel,
     DiffusionPlannerModelConfig,
     infer_model_config_from_dataset_and_anchor_bundle,
+    load_diffusion_planner_bundle,
     save_diffusion_planner_bundle,
 )
+from diffusion.utils import denoise_step_from_x0
 from planners.latent_rollout import latent_rollout
 
 
@@ -107,6 +109,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to an action anchor bundle `.pt` file.",
     )
     parser.add_argument(
+        "--init-bundle-path",
+        default=None,
+        help=(
+            "Optional existing diffusion planner bundle used to initialize model weights "
+            "before training. Useful for score-head-only fine-tuning."
+        ),
+    )
+    parser.add_argument(
         "--wm-policy",
         default=None,
         help="Optional LeWM checkpoint path. Required when --goal-loss-weight > 0.",
@@ -120,22 +130,66 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument(
+        "--freeze-non-score-head",
+        action="store_true",
+        help="Freeze every planner parameter except score_head.* and optimize only the score head.",
+    )
+    parser.add_argument(
         "--val-split",
         type=float,
         default=0.1,
         help="Validation split ratio when no val dataset is provided.",
     )
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
+    parser.add_argument(
+        "--max-train-samples",
+        type=int,
+        default=None,
+        help="Optional cap on loaded training samples, mainly for smoke tests.",
+    )
     parser.add_argument("--log-every", type=int, default=50, help="Train-step logging frequency within an epoch.")
     parser.add_argument(
         "--loss-preset",
-        choices=["legacy", "simple_bce"],
+        choices=["legacy", "simple_bce", "wm_score_regression", "wm_score_topk_margin"],
         default="legacy",
-        help="Optional loss preset. `legacy` preserves the current multi-term objective; `simple_bce` simplifies it.",
+        help=(
+            "Optional loss preset. `legacy` preserves the current multi-term objective; "
+            "`simple_bce` simplifies it; `wm_score_regression` trains score_logits "
+            "to predict normalized -world-model cost while keeping rec_loss; "
+            "`wm_score_topk_margin` trains score_logits to keep the minimum-WM-cost "
+            "candidate inside the score top-k prefilter."
+        ),
     )
     parser.add_argument("--hidden-dim", type=int, default=512, help="Planner hidden dimension.")
     parser.add_argument("--num-layers", type=int, default=3, help="Condition trunk depth.")
     parser.add_argument("--fusion-num-layers", type=int, default=2, help="Fusion trunk depth.")
+    parser.add_argument(
+        "--denoiser-type",
+        choices=["mlp", "dit"],
+        default="mlp",
+        help="Denoiser backend. `mlp` preserves the original flattened action MLP; `dit` uses action-token self-attention with latent cross-attention.",
+    )
+    parser.add_argument("--dit-num-layers", type=int, default=4, help="Number of DiT action-token blocks.")
+    parser.add_argument("--dit-num-heads", type=int, default=4, help="Number of DiT attention heads.")
+    parser.add_argument("--dit-mlp-ratio", type=float, default=4.0, help="DiT block feed-forward expansion ratio.")
+    parser.add_argument(
+        "--score-head-type",
+        choices=["linear", "mlp"],
+        default="linear",
+        help="Score head architecture. `linear` preserves old checkpoints; `mlp` trains a deeper score-only head.",
+    )
+    parser.add_argument(
+        "--score-head-hidden-dim",
+        type=int,
+        default=None,
+        help="Hidden width for --score-head-type mlp. Defaults to --hidden-dim.",
+    )
+    parser.add_argument(
+        "--score-head-num-layers",
+        type=int,
+        default=2,
+        help="Number of hidden Linear layers in --score-head-type mlp.",
+    )
     parser.add_argument("--dropout", type=float, default=0.0, help="MLP dropout.")
     parser.add_argument(
         "--activation",
@@ -301,6 +355,73 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Temperature for the soft anchor-distance ranking targets.",
     )
     parser.add_argument(
+        "--wm-score-ranking-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for score-head ranking supervision from frozen world-model rollout costs. "
+            "When enabled, score_logits are trained against softmax(-wm_cost / temperature)."
+        ),
+    )
+    parser.add_argument(
+        "--wm-score-ranking-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for converting frozen world-model costs into soft score targets.",
+    )
+    parser.add_argument(
+        "--wm-score-target-mode",
+        choices=["softmax", "neg_cost", "argmin_ce_topk_margin"],
+        default="softmax",
+        help=(
+            "Target used by --wm-score-ranking-weight. `softmax` matches a distribution "
+            "softmax(-wm_cost / temperature); `neg_cost` directly regresses score_logits "
+            "toward -wm_cost; `argmin_ce_topk_margin` uses the minimum-cost candidate as "
+            "a top-1 CE label plus an optional top-k boundary margin."
+        ),
+    )
+    parser.add_argument(
+        "--wm-score-ce-temperature",
+        type=float,
+        default=1.0,
+        help="Logit temperature for --wm-score-target-mode argmin_ce_topk_margin.",
+    )
+    parser.add_argument(
+        "--wm-score-topk-margin-k",
+        type=int,
+        default=16,
+        help="Top-k prefilter size optimized by --wm-score-target-mode argmin_ce_topk_margin.",
+    )
+    parser.add_argument(
+        "--wm-score-topk-margin",
+        type=float,
+        default=0.1,
+        help="Required score margin above the top-k negative boundary for the minimum-cost candidate.",
+    )
+    parser.add_argument(
+        "--wm-score-topk-margin-weight",
+        type=float,
+        default=0.5,
+        help="Weight of the top-k boundary margin term in --wm-score-target-mode argmin_ce_topk_margin.",
+    )
+    parser.add_argument(
+        "--wm-score-candidate-source",
+        choices=["single_step", "inference"],
+        default="single_step",
+        help=(
+            "Candidate distribution used for world-model score supervision. "
+            "`single_step` uses the current training timestep. `inference` runs the "
+            "same truncated denoising loop used by eval and supervises the final candidates."
+        ),
+    )
+    parser.add_argument(
+        "--no-wm-score-regression-normalize",
+        dest="wm_score_regression_normalize",
+        action="store_false",
+        help="Disable row-wise z-score normalization for --wm-score-target-mode neg_cost.",
+    )
+    parser.set_defaults(wm_score_regression_normalize=True)
+    parser.add_argument(
         "--grad-clip-norm",
         type=float,
         default=1.0,
@@ -318,12 +439,36 @@ def apply_loss_preset(args: argparse.Namespace) -> dict[str, bool]:
         args.score_ranking_weight = 0.0
         args.enable_goal_pool_loss = False
         args.goal_pool_weight = 0.0
+    elif args.loss_preset == "wm_score_regression":
+        args.cls_loss_type = "bce"
+        args.cls_loss_weight = 0.0
+        args.bce_weight = 0.0
+        args.aux_rec_weight = 0.0
+        args.score_ranking_weight = 0.0
+        args.enable_goal_pool_loss = False
+        args.goal_pool_weight = 0.0
+        args.wm_score_target_mode = "neg_cost"
+        if args.wm_score_ranking_weight == 0.0:
+            args.wm_score_ranking_weight = 1.0
+    elif args.loss_preset == "wm_score_topk_margin":
+        args.cls_loss_type = "bce"
+        args.cls_loss_weight = 0.0
+        args.bce_weight = 0.0
+        args.rec_loss_weight = 0.0
+        args.aux_rec_weight = 0.0
+        args.score_ranking_weight = 0.0
+        args.enable_goal_pool_loss = False
+        args.goal_pool_weight = 0.0
+        args.wm_score_target_mode = "argmin_ce_topk_margin"
+        args.wm_score_candidate_source = "inference"
+        if args.wm_score_ranking_weight == 0.0:
+            args.wm_score_ranking_weight = 1.0
 
     return {
         "aux_rec_enabled": float(args.aux_rec_weight) > 0.0,
         "score_rank_enabled": float(args.score_ranking_weight) > 0.0,
         "goal_pool_enabled": bool(args.enable_goal_pool_loss) and float(args.goal_pool_weight) > 0.0,
-        "wm_rank_enabled": False,
+        "wm_rank_enabled": float(args.wm_score_ranking_weight) > 0.0,
         "diversity_enabled": False,
     }
 
@@ -489,14 +634,155 @@ def build_model_from_dataset_and_anchor_bundle(
         activation=args.activation,
         timestep_embedding_dim=args.timestep_embedding_dim,
         fusion_num_layers=args.fusion_num_layers,
+        denoiser_type=args.denoiser_type,
+        dit_num_layers=args.dit_num_layers,
+        dit_num_heads=args.dit_num_heads,
+        dit_mlp_ratio=args.dit_mlp_ratio,
         num_train_steps=args.num_train_steps,
         truncation_steps=args.truncation_steps,
         start_timestep=args.start_timestep,
         beta_schedule=args.beta_schedule,
         beta_start=args.beta_start,
         beta_end=args.beta_end,
+        score_head_type=args.score_head_type,
+        score_head_hidden_dim=args.score_head_hidden_dim,
+        score_head_num_layers=args.score_head_num_layers,
     )
     return DiffusionPlannerModel.from_anchor_bundle(model_cfg, anchor_bundle)
+
+
+def initialize_model_from_bundle(
+    model: DiffusionPlannerModel,
+    bundle_path: str | Path,
+    *,
+    device: torch.device,
+) -> None:
+    """Initialize a freshly built compatible model from a saved planner bundle."""
+    bundle = load_diffusion_planner_bundle(bundle_path, map_location="cpu")
+    bundle_cfg = bundle.model_hyperparameters
+    current_cfg = model.config
+
+    def get_config_value(config: Any, field_name: str) -> Any:
+        if isinstance(config, dict):
+            return config.get(field_name, None)
+        return getattr(config, field_name)
+
+    checked_fields = (
+        "latent_dim",
+        "input_dim",
+        "hidden_dim",
+        "num_layers",
+        "fusion_num_layers",
+        "action_chunk_dim",
+        "plan_horizon",
+        "action_dim",
+        "num_anchors",
+        "num_train_steps",
+        "truncation_steps",
+        "start_timestep",
+        "beta_schedule",
+        "beta_start",
+        "beta_end",
+        "timestep_embedding_dim",
+        "activation",
+        "denoiser_type",
+        "dit_num_layers",
+        "dit_num_heads",
+        "dit_mlp_ratio",
+    )
+    strict_score_head_fields = (
+        "score_head_type",
+        "score_head_hidden_dim",
+        "score_head_num_layers",
+    )
+    mismatches = []
+    for field_name in checked_fields:
+        bundle_value = get_config_value(bundle_cfg, field_name)
+        current_value = get_config_value(current_cfg, field_name)
+        if bundle_value is None or current_value is None:
+            continue
+        if bundle_value != current_value:
+            mismatches.append(
+                f"{field_name}: bundle={bundle_value!r} "
+                f"current={current_value!r}"
+            )
+    if mismatches:
+        raise ValueError(
+            "Cannot initialize diffusion planner from incompatible bundle:\n"
+            + "\n".join(f"  - {item}" for item in mismatches)
+        )
+    score_head_mismatches = []
+    for field_name in strict_score_head_fields:
+        bundle_value = get_config_value(bundle_cfg, field_name)
+        current_value = get_config_value(current_cfg, field_name)
+        if field_name == "score_head_type" and bundle_value is None:
+            bundle_value = "linear"
+        if field_name == "score_head_num_layers" and bundle_value is None:
+            bundle_value = 2
+        if bundle_value != current_value:
+            score_head_mismatches.append(
+                f"{field_name}: bundle={bundle_value!r} "
+                f"current={current_value!r}"
+            )
+    state_dict = bundle.model_state_dict
+    if score_head_mismatches:
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("score_head.")
+        }
+        load_result = model.load_state_dict(state_dict, strict=False)
+        unexpected_keys = list(load_result.unexpected_keys)
+        missing_non_score = [
+            key for key in load_result.missing_keys if not key.startswith("score_head.")
+        ]
+        if unexpected_keys or missing_non_score:
+            raise ValueError(
+                "Cannot initialize diffusion planner with a different score head because "
+                "non-score parameters did not load cleanly:\n"
+                f"  missing_non_score={missing_non_score}\n"
+                f"  unexpected={unexpected_keys}"
+            )
+        print(
+            "[init] skipped score_head weights because score head config differs: "
+            + "; ".join(score_head_mismatches)
+        )
+    else:
+        model.load_state_dict(state_dict)
+    model.to(device)
+    print(f"[init] loaded diffusion planner weights from {Path(bundle_path).expanduser().resolve()}")
+
+
+def configure_trainable_parameters(
+    model: DiffusionPlannerModel,
+    *,
+    freeze_non_score_head: bool,
+) -> list[torch.nn.Parameter]:
+    """Apply optional score-head-only freezing and return optimizer parameters."""
+    if freeze_non_score_head:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith("score_head."))
+    else:
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+
+    trainable_named = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if not trainable_named:
+        raise ValueError("No trainable diffusion planner parameters remain after applying freeze options.")
+    trainable_count = sum(parameter.numel() for _, parameter in trainable_named)
+    total_count = sum(parameter.numel() for parameter in model.parameters())
+    trainable_names = [name for name, _ in trainable_named]
+    preview = ", ".join(trainable_names[:8])
+    if len(trainable_names) > 8:
+        preview += ", ..."
+    print(
+        "[trainable] "
+        f"freeze_non_score_head={freeze_non_score_head} "
+        f"trainable_params={trainable_count}/{total_count} "
+        f"trainable_tensors={len(trainable_names)} "
+        f"names=[{preview}]"
+    )
+    return [parameter for _, parameter in trainable_named]
 
 
 def _get_plan_config_dict(source: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -957,6 +1243,171 @@ def build_soft_anchor_targets(
     return torch.softmax(scores, dim=-1)  # [B, K]
 
 
+def build_soft_cost_targets(
+    costs: torch.Tensor,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    """Convert candidate costs into soft high-is-good ranking targets.
+
+    costs: [B, K], lower is better.
+    returns: [B, K], higher probability for lower-cost candidates.
+    """
+    if costs.ndim != 2:
+        raise ValueError(f"costs must have shape [B, K], got {tuple(costs.shape)}.")
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be positive, got {temperature}.")
+    finite_mask = torch.isfinite(costs)
+    if not finite_mask.any(dim=-1).all():
+        raise ValueError("Each batch row must contain at least one finite world-model cost.")
+    masked_scores = torch.where(
+        finite_mask,
+        -costs / float(temperature),
+        torch.full_like(costs, float("-inf")),
+    )
+    return torch.softmax(masked_scores, dim=-1)  # [B, K]
+
+
+def normalize_score_rows(values: torch.Tensor) -> torch.Tensor:
+    """Row-wise z-score normalization for candidate score/cost regression."""
+    if values.ndim != 2:
+        raise ValueError(f"values must have shape [B, K], got {tuple(values.shape)}.")
+    return F.layer_norm(values, normalized_shape=(int(values.shape[-1]),))
+
+
+def forward_inference_candidate_scores(
+    model: DiffusionPlannerModel,
+    z_cur: torch.Tensor,
+    z_goal: torch.Tensor,
+    *,
+    noise: torch.Tensor | None = None,
+    eta: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the truncated inference denoising loop and return final candidates/scores.
+
+    This mirrors DiffusionPlannerModel.generate_candidates(), but keeps gradients for
+    score-head fine-tuning. The returned score_logits are from the final denoising
+    network call, matching eval-time score_topk usage.
+    """
+    condition, squeezed = model.encode_condition(z_cur, z_goal)
+    if squeezed:
+        raise ValueError("forward_inference_candidate_scores expects batched latents.")
+    batch_size = int(condition.shape[0])
+    device = condition.device
+    dtype = condition.dtype
+    runtime_schedule = model.schedule.to(device=device, dtype=dtype)
+    runtime_truncation_timesteps = model.resolve_inference_truncation_timesteps(device=device)
+    if runtime_truncation_timesteps.numel() == 0:
+        raise RuntimeError("Diffusion runtime truncation schedule is empty.")
+    initial_timestep = int(runtime_truncation_timesteps[0].item())
+
+    if noise is None:
+        noise = torch.randn(
+            batch_size,
+            model.num_anchors,
+            model.action_chunk_dim,
+            device=device,
+            dtype=dtype,
+        )
+    current, _ = model.initialize_noisy_candidates(
+        batch_size=batch_size,
+        device=device,
+        dtype=dtype,
+        timesteps=initial_timestep,
+        noise=noise,
+    )
+
+    timestep_values = runtime_truncation_timesteps.detach().cpu().tolist()
+    step_pairs = [
+        (int(timestep_values[idx]), int(timestep_values[idx + 1]))
+        for idx in range(len(timestep_values) - 1)
+    ]
+    step_pairs.append((int(timestep_values[-1]), -1))
+
+    last_outputs: dict[str, torch.Tensor] | None = None
+    for current_t, next_t in step_pairs:
+        timestep_grid = model.make_timestep_grid(
+            batch_size=batch_size,
+            timestep=current_t,
+            device=device,
+        )
+        last_outputs = model.forward(z_cur, z_goal, current, timestep_grid)
+        x0_pred = last_outputs["refined_actions"]
+        next_timestep_grid = torch.full(
+            (batch_size, model.num_anchors),
+            int(next_t),
+            device=device,
+            dtype=torch.long,
+        )
+        reverse_noise = None
+        if eta > 0.0:
+            reverse_noise = torch.randn_like(current)
+        current = denoise_step_from_x0(
+            current,
+            x0_pred,
+            timesteps=timestep_grid,
+            next_timesteps=next_timestep_grid,
+            schedule=runtime_schedule,
+            eta=eta,
+            noise=reverse_noise,
+            action_chunk_dim=model.action_chunk_dim,
+        )
+
+    if last_outputs is None:
+        raise RuntimeError("Inference candidate score path produced no outputs.")
+    return last_outputs["candidates"], last_outputs["score_logits"]
+
+
+def compute_wm_score_candidate_costs(
+    *,
+    world_model: torch.nn.Module,
+    z_cur: torch.Tensor,
+    z_goal: torch.Tensor,
+    candidate_actions: torch.Tensor,
+    model: DiffusionPlannerModel,
+    goal_loss_receding_horizon: int,
+    goal_loss_action_block: int,
+    history_size: int,
+) -> torch.Tensor:
+    """Compute WM score targets with the same terminal-cost semantics as JEPA criterion."""
+    action_blocks = reshape_flat_actions_to_rollout_blocks(
+        candidate_actions.detach(),
+        plan_horizon=model.plan_horizon,
+        action_dim=model.action_dim,
+        receding_horizon=int(goal_loss_receding_horizon),
+        action_block=int(goal_loss_action_block),
+    )  # [B, K, receding_horizon, action_block * action_dim]
+    rollout_outputs = latent_rollout(
+        world_model=world_model,
+        z_context=z_cur.detach(),
+        action_blocks=action_blocks,
+        history_size=int(history_size),
+        return_sequence=False,
+        freeze_world_model=True,
+    )
+    wm_score_terminal = rollout_outputs["z_terminal"]  # [B, K, latent_dim]
+    if wm_score_terminal.ndim != 3:
+        raise ValueError(
+            "latent_rollout z_terminal for WM score ranking must have shape [B, K, latent_dim], "
+            f"got {tuple(wm_score_terminal.shape)}."
+        )
+
+    if hasattr(world_model, "criterion"):
+        return world_model.criterion(
+            {
+                "predicted_emb": wm_score_terminal.unsqueeze(2),
+                "goal_emb": z_goal.detach().unsqueeze(1).unsqueeze(2).expand(
+                    int(wm_score_terminal.shape[0]),
+                    int(wm_score_terminal.shape[1]),
+                    1,
+                    int(wm_score_terminal.shape[-1]),
+                ),
+            }
+        )
+
+    return (wm_score_terminal - z_goal.detach().unsqueeze(1)).square().sum(dim=-1)
+
+
 def build_binary_anchor_targets(
     squared_anchor_distances: torch.Tensor,
     *,
@@ -1002,6 +1453,7 @@ def compute_batch_losses(
     goal_loss_receding_horizon: int | None = None,
     goal_loss_action_block: int | None = None,
     noise_override: torch.Tensor | None = None,
+    wm_candidate_costs: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     """Compute the minimal diffusion planner losses.
 
@@ -1037,6 +1489,19 @@ def compute_batch_losses(
     )
     refined_actions = outputs["refined_actions"]  # [B, K, action_chunk_dim]
     score_logits = outputs["score_logits"]  # [B, K]
+
+    wm_score_refined_actions = refined_actions
+    wm_score_logits = score_logits
+    if (
+        args.wm_score_ranking_weight > 0.0
+        and str(getattr(args, "wm_score_candidate_source", "single_step")).lower().strip() == "inference"
+    ):
+        wm_score_refined_actions, wm_score_logits = forward_inference_candidate_scores(
+            model,
+            z_cur,
+            z_goal,
+            noise=noise_override,
+        )
 
     positive_anchor_indices, squared_anchor_distances = assign_positive_anchors(
         teacher_plan,
@@ -1181,11 +1646,115 @@ def compute_batch_losses(
         log_probs = F.log_softmax(score_logits, dim=-1)  # [B, K]
         score_ranking_loss = -(ranking_targets * log_probs).sum(dim=-1).mean()
 
+    wm_score_ranking_loss = torch.zeros((), device=device, dtype=z_cur.dtype)
+    wm_score_best_target_index_acc = torch.zeros((), device=device, dtype=z_cur.dtype)
+    wm_score_best_target_topk_acc = torch.zeros((), device=device, dtype=z_cur.dtype)
+    wm_score_cost_min = torch.zeros((), device=device, dtype=z_cur.dtype)
+    wm_score_cost_mean = torch.zeros((), device=device, dtype=z_cur.dtype)
+    if args.wm_score_ranking_weight > 0.0:
+        if wm_candidate_costs is None:
+            if world_model is None:
+                raise ValueError(
+                    "wm_candidate_costs or world_model must be provided when wm_score_ranking_weight > 0."
+                )
+            if goal_loss_receding_horizon is None or goal_loss_action_block is None:
+                raise ValueError("WM score ranking rollout shape must be resolved before computing losses.")
+            with torch.no_grad():
+                wm_candidate_costs = compute_wm_score_candidate_costs(
+                    world_model=world_model,
+                    z_cur=z_cur,
+                    z_goal=z_goal,
+                    candidate_actions=wm_score_refined_actions,
+                    model=model,
+                    goal_loss_receding_horizon=int(goal_loss_receding_horizon),
+                    goal_loss_action_block=int(goal_loss_action_block),
+                    history_size=int(args.goal_loss_history_size),
+                )
+        wm_candidate_costs = wm_candidate_costs.to(device=device, dtype=wm_score_logits.dtype)
+        if tuple(wm_candidate_costs.shape) != tuple(wm_score_logits.shape):
+            raise ValueError(
+                "wm_candidate_costs and score_logits must have matching [B, K] shape, "
+                f"got {tuple(wm_candidate_costs.shape)} and {tuple(wm_score_logits.shape)}."
+            )
+        wm_score_target_mode = str(getattr(args, "wm_score_target_mode", "softmax")).lower().strip()
+        if wm_score_target_mode == "softmax":
+            wm_targets = build_soft_cost_targets(
+                wm_candidate_costs.detach(),
+                temperature=float(args.wm_score_ranking_temperature),
+            )
+            wm_log_probs = F.log_softmax(wm_score_logits, dim=-1)
+            wm_score_ranking_loss = -(wm_targets * wm_log_probs).sum(dim=-1).mean()
+        elif wm_score_target_mode == "neg_cost":
+            wm_targets = -wm_candidate_costs.detach()
+            wm_predictions = wm_score_logits
+            if bool(getattr(args, "wm_score_regression_normalize", True)):
+                wm_targets = normalize_score_rows(wm_targets)
+                wm_predictions = normalize_score_rows(wm_predictions)
+            wm_score_ranking_loss = F.mse_loss(wm_predictions, wm_targets)
+        elif wm_score_target_mode == "argmin_ce_topk_margin":
+            wm_target_best_indices = torch.argmin(wm_candidate_costs.detach(), dim=-1)
+            ce_temperature = max(float(getattr(args, "wm_score_ce_temperature", 1.0)), 1e-6)
+            wm_score_ranking_loss = F.cross_entropy(
+                wm_score_logits / ce_temperature,
+                wm_target_best_indices,
+            )
+            topk_margin_weight = float(getattr(args, "wm_score_topk_margin_weight", 0.0))
+            if topk_margin_weight > 0.0:
+                best_scores = wm_score_logits.gather(
+                    1,
+                    wm_target_best_indices.view(-1, 1),
+                ).squeeze(1)  # [B]
+                best_mask = F.one_hot(
+                    wm_target_best_indices,
+                    num_classes=int(wm_score_logits.shape[-1]),
+                ).to(dtype=torch.bool, device=wm_score_logits.device)  # [B, K]
+                negative_scores = wm_score_logits.masked_fill(best_mask, float("-inf"))
+                negative_count = max(1, int(wm_score_logits.shape[-1]) - 1)
+                boundary_k = min(
+                    int(getattr(args, "wm_score_topk_margin_k", 16)),
+                    negative_count,
+                )
+                topk_negative_boundary = torch.topk(
+                    negative_scores,
+                    k=boundary_k,
+                    dim=-1,
+                    largest=True,
+                ).values[:, -1]  # [B]
+                topk_margin = float(getattr(args, "wm_score_topk_margin", 0.1))
+                topk_margin_loss = F.relu(
+                    topk_margin - best_scores + topk_negative_boundary
+                ).mean()
+                wm_score_ranking_loss = wm_score_ranking_loss + topk_margin_weight * topk_margin_loss
+        else:
+            raise ValueError(
+                "wm_score_target_mode must be one of {'softmax', 'neg_cost', 'argmin_ce_topk_margin'}, "
+                f"got '{wm_score_target_mode}'."
+            )
+        wm_target_best_indices = torch.argmin(wm_candidate_costs.detach(), dim=-1)
+        wm_pred_best_indices = torch.argmax(wm_score_logits.detach(), dim=-1)
+        wm_score_best_target_index_acc = wm_pred_best_indices.eq(wm_target_best_indices).float().mean()
+        metric_topk = min(
+            int(getattr(args, "wm_score_topk_margin_k", 16)),
+            int(wm_score_logits.shape[-1]),
+        )
+        wm_score_topk_indices = torch.topk(
+            wm_score_logits.detach(),
+            k=metric_topk,
+            dim=-1,
+            largest=True,
+        ).indices
+        wm_score_best_target_topk_acc = (
+            wm_score_topk_indices.eq(wm_target_best_indices.view(-1, 1)).any(dim=-1).float().mean()
+        )
+        wm_score_cost_min = wm_candidate_costs.detach().min(dim=-1).values.mean()
+        wm_score_cost_mean = wm_candidate_costs.detach().mean()
+
     total_loss = (
         cls_loss
         + args.rec_loss_weight * rec_loss
         + args.aux_rec_weight * aux_rec_loss
         + args.score_ranking_weight * score_ranking_loss
+        + args.wm_score_ranking_weight * wm_score_ranking_loss
         + args.goal_loss_weight * goal_pos_loss
         + args.goal_pool_weight * goal_pool_loss
     )
@@ -1209,11 +1778,16 @@ def compute_batch_losses(
         "rec_loss": float(rec_loss.detach().item()),
         "aux_rec_loss": float(aux_rec_loss.detach().item()),
         "score_ranking_loss": float(score_ranking_loss.detach().item()),
+        "wm_score_ranking_loss": float(wm_score_ranking_loss.detach().item()),
         "goal_pos_loss": float(goal_pos_loss.detach().item()),
         "goal_pool_loss": float(goal_pool_loss.detach().item()),
         "goal_loss": float((goal_pos_loss + goal_pool_loss).detach().item()),
         "goal_pool_cost_min": float(goal_pool_cost_min.detach().item()),
         "goal_pool_cost_mean": float(goal_pool_cost_mean.detach().item()),
+        "wm_score_best_target_index_acc": float(wm_score_best_target_index_acc.detach().item()),
+        "wm_score_best_target_topk_acc": float(wm_score_best_target_topk_acc.detach().item()),
+        "wm_score_cost_min": float(wm_score_cost_min.detach().item()),
+        "wm_score_cost_mean": float(wm_score_cost_mean.detach().item()),
         "total_loss": float(total_loss.detach().item()),
         "cls_acc": float(cls_acc.detach().item()),
         "positive_anchor_l2": float(torch.sqrt(squared_anchor_distances.min(dim=-1).values).mean().detach().item()),
@@ -1228,6 +1802,7 @@ def compute_batch_losses(
         "rec_loss": rec_loss,
         "aux_rec_loss": aux_rec_loss,
         "score_ranking_loss": score_ranking_loss,
+        "wm_score_ranking_loss": wm_score_ranking_loss,
         "goal_pos_loss": goal_pos_loss,
         "goal_pool_loss": goal_pool_loss,
         "goal_loss": goal_pos_loss + goal_pool_loss,
@@ -1253,13 +1828,18 @@ def train_one_epoch(
     total_rec_loss = 0.0
     total_aux_rec_loss = 0.0
     total_score_ranking_loss = 0.0
+    total_wm_score_ranking_loss = 0.0
     total_goal_pos_loss = 0.0
     total_goal_pool_loss = 0.0
     total_goal_loss = 0.0
     total_goal_pool_cost_min = 0.0
     total_goal_pool_cost_mean = 0.0
+    total_wm_score_cost_min = 0.0
+    total_wm_score_cost_mean = 0.0
     total_loss = 0.0
     total_cls_acc = 0.0
+    total_wm_score_best_target_index_acc = 0.0
+    total_wm_score_best_target_topk_acc = 0.0
     total_anchor_l2 = 0.0
     total_topk_anchor_l2 = 0.0
     total_samples = 0
@@ -1288,7 +1868,10 @@ def train_one_epoch(
         loss_dict["total_loss"].backward()
 
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(
+                [parameter for parameter in model.parameters() if parameter.requires_grad],
+                max_norm=args.grad_clip_norm,
+            )
         optimizer.step()
 
         total_cls_loss += metrics["cls_loss"] * batch_size
@@ -1297,13 +1880,18 @@ def train_one_epoch(
         total_rec_loss += metrics["rec_loss"] * batch_size
         total_aux_rec_loss += metrics["aux_rec_loss"] * batch_size
         total_score_ranking_loss += metrics["score_ranking_loss"] * batch_size
+        total_wm_score_ranking_loss += metrics["wm_score_ranking_loss"] * batch_size
         total_goal_pos_loss += metrics["goal_pos_loss"] * batch_size
         total_goal_pool_loss += metrics["goal_pool_loss"] * batch_size
         total_goal_loss += metrics["goal_loss"] * batch_size
         total_goal_pool_cost_min += metrics["goal_pool_cost_min"] * batch_size
         total_goal_pool_cost_mean += metrics["goal_pool_cost_mean"] * batch_size
+        total_wm_score_cost_min += metrics["wm_score_cost_min"] * batch_size
+        total_wm_score_cost_mean += metrics["wm_score_cost_mean"] * batch_size
         total_loss += metrics["total_loss"] * batch_size
         total_cls_acc += metrics["cls_acc"] * batch_size
+        total_wm_score_best_target_index_acc += metrics["wm_score_best_target_index_acc"] * batch_size
+        total_wm_score_best_target_topk_acc += metrics["wm_score_best_target_topk_acc"] * batch_size
         total_anchor_l2 += metrics["positive_anchor_l2"] * batch_size
         total_topk_anchor_l2 += metrics["topk_anchor_l2"] * batch_size
         total_samples += batch_size
@@ -1318,10 +1906,15 @@ def train_one_epoch(
                 f"bce_loss={metrics['bce_loss']:.6f} rec_loss={metrics['rec_loss']:.6f} "
                 f"aux_rec_loss={metrics['aux_rec_loss']:.6f} "
                 f"score_ranking_loss={metrics['score_ranking_loss']:.6f} "
+                f"wm_score_ranking_loss={metrics['wm_score_ranking_loss']:.6f} "
                 f"goal_pos_loss={metrics['goal_pos_loss']:.6f} "
                 f"goal_pool_loss={metrics['goal_pool_loss']:.6f} "
                 f"goal_pool_cost_min={metrics['goal_pool_cost_min']:.6f} "
                 f"goal_pool_cost_mean={metrics['goal_pool_cost_mean']:.6f} "
+                f"wm_score_cost_min={metrics['wm_score_cost_min']:.6f} "
+                f"wm_score_cost_mean={metrics['wm_score_cost_mean']:.6f} "
+                f"wm_score_acc={metrics['wm_score_best_target_index_acc']:.4f} "
+                f"wm_score_topk_acc={metrics['wm_score_best_target_topk_acc']:.4f} "
                 f"cls_acc={metrics['cls_acc']:.4f} timesteps={unique_timesteps}"
             )
 
@@ -1332,13 +1925,18 @@ def train_one_epoch(
         "rec_loss": total_rec_loss / max(total_samples, 1),
         "aux_rec_loss": total_aux_rec_loss / max(total_samples, 1),
         "score_ranking_loss": total_score_ranking_loss / max(total_samples, 1),
+        "wm_score_ranking_loss": total_wm_score_ranking_loss / max(total_samples, 1),
         "goal_pos_loss": total_goal_pos_loss / max(total_samples, 1),
         "goal_pool_loss": total_goal_pool_loss / max(total_samples, 1),
         "goal_loss": total_goal_loss / max(total_samples, 1),
         "goal_pool_cost_min": total_goal_pool_cost_min / max(total_samples, 1),
         "goal_pool_cost_mean": total_goal_pool_cost_mean / max(total_samples, 1),
+        "wm_score_cost_min": total_wm_score_cost_min / max(total_samples, 1),
+        "wm_score_cost_mean": total_wm_score_cost_mean / max(total_samples, 1),
         "loss": total_loss / max(total_samples, 1),
         "cls_acc": total_cls_acc / max(total_samples, 1),
+        "wm_score_best_target_index_acc": total_wm_score_best_target_index_acc / max(total_samples, 1),
+        "wm_score_best_target_topk_acc": total_wm_score_best_target_topk_acc / max(total_samples, 1),
         "positive_anchor_l2": total_anchor_l2 / max(total_samples, 1),
         "topk_anchor_l2": total_topk_anchor_l2 / max(total_samples, 1),
     }
@@ -1363,13 +1961,18 @@ def evaluate(
     total_rec_loss = 0.0
     total_aux_rec_loss = 0.0
     total_score_ranking_loss = 0.0
+    total_wm_score_ranking_loss = 0.0
     total_goal_pos_loss = 0.0
     total_goal_pool_loss = 0.0
     total_goal_loss = 0.0
     total_goal_pool_cost_min = 0.0
     total_goal_pool_cost_mean = 0.0
+    total_wm_score_cost_min = 0.0
+    total_wm_score_cost_mean = 0.0
     total_loss = 0.0
     total_cls_acc = 0.0
+    total_wm_score_best_target_index_acc = 0.0
+    total_wm_score_best_target_topk_acc = 0.0
     total_anchor_l2 = 0.0
     total_topk_anchor_l2 = 0.0
     total_samples = 0
@@ -1407,13 +2010,18 @@ def evaluate(
         total_rec_loss += metrics["rec_loss"] * batch_size
         total_aux_rec_loss += metrics["aux_rec_loss"] * batch_size
         total_score_ranking_loss += metrics["score_ranking_loss"] * batch_size
+        total_wm_score_ranking_loss += metrics["wm_score_ranking_loss"] * batch_size
         total_goal_pos_loss += metrics["goal_pos_loss"] * batch_size
         total_goal_pool_loss += metrics["goal_pool_loss"] * batch_size
         total_goal_loss += metrics["goal_loss"] * batch_size
         total_goal_pool_cost_min += metrics["goal_pool_cost_min"] * batch_size
         total_goal_pool_cost_mean += metrics["goal_pool_cost_mean"] * batch_size
+        total_wm_score_cost_min += metrics["wm_score_cost_min"] * batch_size
+        total_wm_score_cost_mean += metrics["wm_score_cost_mean"] * batch_size
         total_loss += metrics["total_loss"] * batch_size
         total_cls_acc += metrics["cls_acc"] * batch_size
+        total_wm_score_best_target_index_acc += metrics["wm_score_best_target_index_acc"] * batch_size
+        total_wm_score_best_target_topk_acc += metrics["wm_score_best_target_topk_acc"] * batch_size
         total_anchor_l2 += metrics["positive_anchor_l2"] * batch_size
         total_topk_anchor_l2 += metrics["topk_anchor_l2"] * batch_size
         total_samples += batch_size
@@ -1425,13 +2033,18 @@ def evaluate(
         f"{split}/rec_loss": total_rec_loss / max(total_samples, 1),
         f"{split}/aux_rec_loss": total_aux_rec_loss / max(total_samples, 1),
         f"{split}/score_ranking_loss": total_score_ranking_loss / max(total_samples, 1),
+        f"{split}/wm_score_ranking_loss": total_wm_score_ranking_loss / max(total_samples, 1),
         f"{split}/goal_pos_loss": total_goal_pos_loss / max(total_samples, 1),
         f"{split}/goal_pool_loss": total_goal_pool_loss / max(total_samples, 1),
         f"{split}/goal_loss": total_goal_loss / max(total_samples, 1),
         f"{split}/goal_pool_cost_min": total_goal_pool_cost_min / max(total_samples, 1),
         f"{split}/goal_pool_cost_mean": total_goal_pool_cost_mean / max(total_samples, 1),
+        f"{split}/wm_score_cost_min": total_wm_score_cost_min / max(total_samples, 1),
+        f"{split}/wm_score_cost_mean": total_wm_score_cost_mean / max(total_samples, 1),
         f"{split}/loss": total_loss / max(total_samples, 1),
         f"{split}/cls_acc": total_cls_acc / max(total_samples, 1),
+        f"{split}/wm_score_best_target_index_acc": total_wm_score_best_target_index_acc / max(total_samples, 1),
+        f"{split}/wm_score_best_target_topk_acc": total_wm_score_best_target_topk_acc / max(total_samples, 1),
         f"{split}/positive_anchor_l2": total_anchor_l2 / max(total_samples, 1),
         f"{split}/topk_anchor_l2": total_topk_anchor_l2 / max(total_samples, 1),
     }
@@ -1483,15 +2096,21 @@ def main(argv: list[str] | None = None) -> None:
         or args.rec_loss_weight < 0.0
         or args.aux_rec_weight < 0.0
         or args.score_ranking_weight < 0.0
+        or args.wm_score_ranking_weight < 0.0
         or args.goal_loss_weight < 0.0
         or args.goal_pool_weight < 0.0
     ):
         raise ValueError("Loss weights must be non-negative.")
     if args.goal_loss_history_size <= 0:
         raise ValueError(f"goal_loss_history_size must be positive, got {args.goal_loss_history_size}.")
-    if (args.goal_loss_weight > 0.0 or args.enable_goal_pool_loss) and args.wm_policy in [None, "", "null"]:
+    wm_loss_enabled = (
+        args.goal_loss_weight > 0.0
+        or args.enable_goal_pool_loss
+        or args.wm_score_ranking_weight > 0.0
+    )
+    if wm_loss_enabled and args.wm_policy in [None, "", "null"]:
         raise ValueError(
-            "--goal-loss-weight > 0 or --enable-goal-pool-loss requires --wm-policy "
+            "World-model-supervised losses require --wm-policy "
             "to load the frozen LeWM predictor."
         )
     if args.goal_pool_topk <= 0:
@@ -1500,6 +2119,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"bce_pos_topk must be positive, got {args.bce_pos_topk}.")
     if args.goal_pool_tau <= 0.0:
         raise ValueError(f"goal_pool_tau must be positive, got {args.goal_pool_tau}.")
+    if args.max_train_samples is not None and args.max_train_samples <= 1:
+        raise ValueError(f"max_train_samples must be greater than 1 when set, got {args.max_train_samples}.")
     if args.aux_rec_topk <= 0:
         raise ValueError(f"aux_rec_topk must be positive, got {args.aux_rec_topk}.")
     if args.aux_rec_temperature <= 0.0:
@@ -1511,6 +2132,52 @@ def main(argv: list[str] | None = None) -> None:
             "score_ranking_temperature must be positive, "
             f"got {args.score_ranking_temperature}."
         )
+    if args.wm_score_ranking_temperature <= 0.0:
+        raise ValueError(
+            "wm_score_ranking_temperature must be positive, "
+            f"got {args.wm_score_ranking_temperature}."
+        )
+    if args.wm_score_ce_temperature <= 0.0:
+        raise ValueError(
+            "wm_score_ce_temperature must be positive, "
+            f"got {args.wm_score_ce_temperature}."
+        )
+    if args.wm_score_topk_margin_k <= 0:
+        raise ValueError(
+            "wm_score_topk_margin_k must be positive, "
+            f"got {args.wm_score_topk_margin_k}."
+        )
+    if args.wm_score_topk_margin < 0.0:
+        raise ValueError(
+            "wm_score_topk_margin must be non-negative, "
+            f"got {args.wm_score_topk_margin}."
+        )
+    if args.wm_score_topk_margin_weight < 0.0:
+        raise ValueError(
+            "wm_score_topk_margin_weight must be non-negative, "
+            f"got {args.wm_score_topk_margin_weight}."
+        )
+    if args.dit_num_layers <= 0:
+        raise ValueError(f"dit_num_layers must be positive, got {args.dit_num_layers}.")
+    if args.dit_num_heads <= 0:
+        raise ValueError(f"dit_num_heads must be positive, got {args.dit_num_heads}.")
+    if args.hidden_dim % args.dit_num_heads != 0:
+        raise ValueError(
+            "hidden_dim must be divisible by dit_num_heads, "
+            f"got hidden_dim={args.hidden_dim}, dit_num_heads={args.dit_num_heads}."
+        )
+    if args.dit_mlp_ratio <= 0.0:
+        raise ValueError(f"dit_mlp_ratio must be positive, got {args.dit_mlp_ratio}.")
+    if args.score_head_hidden_dim is not None and args.score_head_hidden_dim <= 0:
+        raise ValueError(
+            "score_head_hidden_dim must be positive when provided, "
+            f"got {args.score_head_hidden_dim}."
+        )
+    if args.score_head_num_layers <= 0:
+        raise ValueError(
+            "score_head_num_layers must be positive, "
+            f"got {args.score_head_num_layers}."
+        )
     classification_enabled = (
         (args.cls_loss_type in {"ce", "ce_bce"} and args.cls_loss_weight > 0.0)
         or (args.cls_loss_type in {"bce", "ce_bce"} and args.bce_weight > 0.0)
@@ -1520,12 +2187,13 @@ def main(argv: list[str] | None = None) -> None:
         and args.rec_loss_weight == 0.0
         and args.aux_rec_weight == 0.0
         and args.score_ranking_weight == 0.0
+        and args.wm_score_ranking_weight == 0.0
         and args.goal_loss_weight == 0.0
         and (not args.enable_goal_pool_loss or args.goal_pool_weight == 0.0)
     ):
         raise ValueError(
             "At least one of CE/BCE classification, rec_loss_weight, aux_rec_weight, "
-            "score_ranking_weight, goal_loss_weight, or goal_pool_weight must be positive."
+            "score_ranking_weight, wm_score_ranking_weight, goal_loss_weight, or goal_pool_weight must be positive."
         )
 
     set_seed(args.seed)
@@ -1537,6 +2205,11 @@ def main(argv: list[str] | None = None) -> None:
     train_bundle = load_dataset_bundle(args.dataset_path)
     anchor_bundle = load_anchor_bundle(args.anchor_bundle_path)
     train_dataset = DiffusionPlannerTensorDataset(train_bundle)
+    if args.max_train_samples is not None:
+        train_dataset = torch.utils.data.Subset(
+            train_dataset,
+            list(range(min(int(args.max_train_samples), len(train_dataset)))),
+        )
     train_dataset_spec = validate_anchor_dataset_compatibility(
         dataset_bundle=train_bundle,
         anchor_bundle=anchor_bundle,
@@ -1563,10 +2236,20 @@ def main(argv: list[str] | None = None) -> None:
         anchor_bundle=anchor_bundle,
         args=args,
     ).to(device)
+    if args.init_bundle_path not in [None, "", "null"]:
+        initialize_model_from_bundle(
+            model,
+            args.init_bundle_path,
+            device=device,
+        )
+    trainable_parameters = configure_trainable_parameters(
+        model,
+        freeze_non_score_head=bool(args.freeze_non_score_head),
+    )
     world_model = None
     goal_loss_receding_horizon = None
     goal_loss_action_block = None
-    if args.goal_loss_weight > 0.0 or args.enable_goal_pool_loss:
+    if wm_loss_enabled:
         goal_loss_receding_horizon, goal_loss_action_block = infer_goal_loss_rollout_shape(
             args=args,
             dataset_bundle=train_bundle,
@@ -1575,10 +2258,11 @@ def main(argv: list[str] | None = None) -> None:
         )
         world_model = load_frozen_world_model(args.wm_policy, device=device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
     rec_loss_fn = build_reconstruction_loss_fn(args.rec_loss)
     train_task = train_dataset_spec.get("task", "unknown")
     goal_loss_enabled = bool(args.goal_loss_weight > 0.0 or args.enable_goal_pool_loss)
+    wm_score_ranking_enabled = bool(args.wm_score_ranking_weight > 0.0)
 
     if train_task in {"tworoom", "reacher"} and args.loss_preset != "simple_bce":
         print(
@@ -1592,6 +2276,12 @@ def main(argv: list[str] | None = None) -> None:
         f"action_chunk_horizon={model.action_chunk_horizon} "
         f"action_chunk_dim={model.action_chunk_dim} plan_horizon={model.plan_horizon} "
         f"action_dim={model.action_dim} num_anchors={model.num_anchors} "
+        f"denoiser_type={model.config.denoiser_type} "
+        f"dit_num_layers={model.config.dit_num_layers} "
+        f"dit_num_heads={model.config.dit_num_heads} "
+        f"score_head_type={model.config.score_head_type} "
+        f"score_head_hidden_dim={model.config.score_head_hidden_dim} "
+        f"score_head_num_layers={model.config.score_head_num_layers} "
         f"anchor_shape={tuple(anchor_bundle.anchors.shape)} "
         f"anchor_task={anchor_bundle.task} "
         f"anchor_action_chunk_horizon={anchor_bundle.action_chunk_horizon} "
@@ -1604,6 +2294,10 @@ def main(argv: list[str] | None = None) -> None:
         f"bce_pos_topk={args.bce_pos_topk} rec_loss_weight={args.rec_loss_weight} "
         f"aux_rec_topk={args.aux_rec_topk} aux_rec_weight={args.aux_rec_weight} "
         f"score_ranking_weight={args.score_ranking_weight} goal_loss_weight={args.goal_loss_weight} "
+        f"wm_score_ranking_weight={args.wm_score_ranking_weight} "
+        f"wm_score_ranking_temperature={args.wm_score_ranking_temperature} "
+        f"wm_score_candidate_source={args.wm_score_candidate_source} "
+        f"wm_score_ranking_enabled={wm_score_ranking_enabled} "
         f"goal_loss_enabled={goal_loss_enabled} "
         f"enable_goal_pool_loss={args.enable_goal_pool_loss} goal_pool_weight={args.goal_pool_weight} "
         f"goal_pool_topk={args.goal_pool_topk} goal_pool_tau={args.goal_pool_tau} "
@@ -1617,7 +2311,7 @@ def main(argv: list[str] | None = None) -> None:
         f"aux_rec={'enabled' if loss_feature_flags['aux_rec_enabled'] else 'disabled'} "
         f"score_rank={'enabled' if loss_feature_flags['score_rank_enabled'] else 'disabled'} "
         f"goal_pool={'enabled' if loss_feature_flags['goal_pool_enabled'] else 'disabled'} "
-        f"wm_rank={'enabled' if loss_feature_flags['wm_rank_enabled'] else 'disabled'} "
+        f"wm_score_rank={'enabled' if loss_feature_flags['wm_rank_enabled'] else 'disabled'} "
         f"diversity={'enabled' if loss_feature_flags['diversity_enabled'] else 'disabled'}"
     )
 
@@ -1662,11 +2356,16 @@ def main(argv: list[str] | None = None) -> None:
             f"train_rec_loss={train_metrics['rec_loss']:.6f} "
             f"train_aux_rec_loss={train_metrics['aux_rec_loss']:.6f} "
             f"train_score_ranking_loss={train_metrics['score_ranking_loss']:.6f} "
+            f"train_wm_score_ranking_loss={train_metrics['wm_score_ranking_loss']:.6f} "
             f"train_goal_pos_loss={train_metrics['goal_pos_loss']:.6f} "
             f"train_goal_pool_loss={train_metrics['goal_pool_loss']:.6f} "
             f"train_goal_pool_cost_min={train_metrics['goal_pool_cost_min']:.6f} "
             f"train_goal_pool_cost_mean={train_metrics['goal_pool_cost_mean']:.6f} "
+            f"train_wm_score_cost_min={train_metrics['wm_score_cost_min']:.6f} "
+            f"train_wm_score_cost_mean={train_metrics['wm_score_cost_mean']:.6f} "
             f"train_cls_acc={train_metrics['cls_acc']:.4f} "
+            f"train_wm_score_acc={train_metrics['wm_score_best_target_index_acc']:.4f} "
+            f"train_wm_score_topk_acc={train_metrics['wm_score_best_target_topk_acc']:.4f} "
             f"train_positive_anchor_l2={train_metrics['positive_anchor_l2']:.4f} "
             f"train_topk_anchor_l2={train_metrics['topk_anchor_l2']:.4f} "
             f"val_loss={val_metrics['val/loss']:.6f} val_cls_loss={val_metrics['val/cls_loss']:.6f} "
@@ -1674,11 +2373,16 @@ def main(argv: list[str] | None = None) -> None:
             f"val_rec_loss={val_metrics['val/rec_loss']:.6f} "
             f"val_aux_rec_loss={val_metrics['val/aux_rec_loss']:.6f} "
             f"val_score_ranking_loss={val_metrics['val/score_ranking_loss']:.6f} "
+            f"val_wm_score_ranking_loss={val_metrics['val/wm_score_ranking_loss']:.6f} "
             f"val_goal_pos_loss={val_metrics['val/goal_pos_loss']:.6f} "
             f"val_goal_pool_loss={val_metrics['val/goal_pool_loss']:.6f} "
             f"val_goal_pool_cost_min={val_metrics['val/goal_pool_cost_min']:.6f} "
             f"val_goal_pool_cost_mean={val_metrics['val/goal_pool_cost_mean']:.6f} "
+            f"val_wm_score_cost_min={val_metrics['val/wm_score_cost_min']:.6f} "
+            f"val_wm_score_cost_mean={val_metrics['val/wm_score_cost_mean']:.6f} "
             f"val_cls_acc={val_metrics['val/cls_acc']:.4f} "
+            f"val_wm_score_acc={val_metrics['val/wm_score_best_target_index_acc']:.4f} "
+            f"val_wm_score_topk_acc={val_metrics['val/wm_score_best_target_topk_acc']:.4f} "
             f"val_positive_anchor_l2={val_metrics['val/positive_anchor_l2']:.4f} "
             f"val_topk_anchor_l2={val_metrics['val/topk_anchor_l2']:.4f}"
         )

@@ -9,7 +9,6 @@ import stable_worldmodel as swm
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
-from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from diffusion.corrector import (

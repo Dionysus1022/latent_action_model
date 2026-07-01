@@ -308,6 +308,68 @@ class DiffusionDatasetBuilderPathTests(unittest.TestCase):
             self.assertEqual(cache_dir, root)
 
 
+class DiffusionDatasetBuilderMetadataTests(unittest.TestCase):
+    def test_collate_samples_saves_overridden_plan_config_from_task_spec(self) -> None:
+        import argparse
+
+        import torch
+        from omegaconf import OmegaConf
+
+        from planners.build_single_peak_dataset import TaskSpec, collate_samples
+
+        args = argparse.Namespace(
+            mode="build",
+            label_source="trajectory",
+            config=None,
+            wm_policy="/tmp/lewm_epoch_29",
+            teacher_policy=None,
+            seed=42,
+        )
+        cfg = OmegaConf.create(
+            {
+                "plan_config": {
+                    "horizon": 5,
+                    "receding_horizon": 5,
+                    "action_block": 5,
+                }
+            }
+        )
+        task_spec = TaskSpec(
+            requested_task_name="reacher",
+            canonical_task_name="reacher",
+            eval_config_name="reacher",
+            dataset_name="dmc/reacher_random",
+            goal_offset_steps=25,
+            eval_budget=1000,
+            receding_horizon=1,
+            action_block=5,
+            action_chunk_horizon=5,
+            pixels_key="pixels",
+            action_key="action",
+            episode_key="episode",
+            step_key="step",
+            action_dim=2,
+            action_chunk_dim=10,
+        )
+        output = collate_samples(
+            [
+                {
+                    "z_cur": torch.zeros(4),
+                    "z_goal": torch.ones(4),
+                    "teacher_plan": torch.zeros(10),
+                    "meta": {},
+                }
+            ],
+            args=args,
+            cfg=cfg,
+            task_spec=task_spec,
+        )
+
+        saved_plan_config = output["build_info"]["plan_config"]
+        self.assertEqual(saved_plan_config["receding_horizon"], 1)
+        self.assertEqual(saved_plan_config["action_block"], 5)
+
+
 class DiffusionEvalPathTests(unittest.TestCase):
     def test_eval_explicit_dataset_h5_defaults_to_file_stem_and_parent_cache_dir(self) -> None:
         from eval import resolve_explicit_dataset_source
@@ -347,6 +409,40 @@ class LegacyDiffusionPipelineScriptTests(unittest.TestCase):
             self.assertIn("--dataset-h5", completed.stdout)
             self.assertIn(str(input_h5), completed.stdout)
             self.assertIn(f"dataset_h5={input_h5}", completed.stdout)
+
+    def test_reacher_horizon_script_dry_run_threads_horizon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_h5 = root / "reacher.h5"
+            input_h5.write_bytes(b"h5")
+            wm_policy = root / "lewm_epoch_29"
+            output_root = root / "diffusion_pipeline"
+            cmd = [
+                "bash",
+                "scripts/run_reacher_diffusion_horizon_pipeline.sh",
+                "--horizon",
+                "5",
+                "--input-h5",
+                str(input_h5),
+                "--wm-policy",
+                str(wm_policy),
+                "--output-root",
+                str(output_root),
+                "--dry-run",
+            ]
+            completed = subprocess.run(
+                cmd,
+                cwd=Path(__file__).resolve().parents[1],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertIn("horizon=5", completed.stdout)
+            self.assertIn("receding_horizon=1", completed.stdout)
+            self.assertIn("action_block=5", completed.stdout)
+            self.assertIn("reacher_h5", completed.stdout)
+            self.assertIn("--plan-horizon", completed.stdout)
+            self.assertIn("--loss-preset simple_bce", completed.stdout)
 
 
 class DiffusionHydraConfigTests(unittest.TestCase):
